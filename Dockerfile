@@ -17,6 +17,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code
 
+# md viewer (markdown browser + live Claude transcript viewer) — served on
+# 8085 and exposed through a cloudflared quick tunnel that the entrypoint
+# announces to the Discord channel at startup
+COPY --from=golang:1.25-bookworm /usr/local/go /usr/local/go
+# cache-bust: this URL's content changes with every commit to md, so the
+# clone layer below rebuilds exactly when the repo does
+ADD https://api.github.com/repos/danroblewis/md/commits/main /tmp/md-head.json
+RUN git clone --depth 1 https://github.com/danroblewis/md.git /opt/md \
+ && cd /opt/md && /usr/local/go/bin/go build -o /usr/local/bin/md . \
+ && rm -rf /opt/md /root/go /root/.cache
+
+# cloudflared (quick tunnels need no account)
+RUN curl -fsSL -o /usr/local/bin/cloudflared \
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$(dpkg --print-architecture)" \
+ && chmod +x /usr/local/bin/cloudflared
+
+COPY dev-entrypoint.sh /usr/local/bin/dev-entrypoint.sh
+RUN chmod +x /usr/local/bin/dev-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/dev-entrypoint.sh"]
+
 # Lets claude run with --dangerously-skip-permissions as root
 ENV IS_SANDBOX=1
 

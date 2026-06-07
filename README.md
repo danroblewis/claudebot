@@ -72,6 +72,22 @@ The image is chosen in this order:
 4. the bundled `Dockerfile` — built as `claudebot` (the node base is only
    because Claude Code is an npm package; it's general-purpose Debian)
 
+### The md viewer + tunnel
+
+The bundled image ships the [md viewer](https://github.com/danroblewis/md)
+(a markdown/file browser with a live Claude-transcript viewer) and
+`cloudflared`. On container start the entrypoint serves the project on
+port 8085, opens a cloudflared quick tunnel, waits until the tunnel
+actually answers (fresh trycloudflare subdomains take a while to resolve —
+it verifies over DoH to dodge negative DNS caching), and posts
+`🌐 md viewer: https://….trycloudflare.com` to the Discord channel. Since
+the container's `/root/.claude` is the persistent `container-home/`, that
+link also lets you read the live session transcript from any device.
+
+The announce works because claudebot passes `CLAUDEBOT_DISCORD_TOKEN` and
+`CLAUDEBOT_CHANNEL_ID` into every container — your own scripts can use them
+to post to the bridged channel too.
+
 Builds rerun on every launch, so Dockerfile edits are picked up (docker's
 layer cache makes unchanged builds near-instant).
 
@@ -87,6 +103,32 @@ RUN apt-get update && apt-get install -y curl ca-certificates git \
  && apt-get install -y nodejs \
  && npm install -g @anthropic-ai/claude-code
 ```
+
+To get the md viewer + tunnel announce in a custom image, add:
+
+```dockerfile
+# md viewer, built from source
+COPY --from=golang:1.25-bookworm /usr/local/go /usr/local/go
+ADD https://api.github.com/repos/danroblewis/md/commits/main /tmp/md-head.json
+RUN git clone --depth 1 https://github.com/danroblewis/md.git /opt/md \
+ && cd /opt/md && /usr/local/go/bin/go build -o /usr/local/bin/md . \
+ && rm -rf /opt/md /root/go /root/.cache
+
+# cloudflared (quick tunnels need no account)
+RUN curl -fsSL -o /usr/local/bin/cloudflared \
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$(dpkg --print-architecture)" \
+ && chmod +x /usr/local/bin/cloudflared
+
+# starts md + tunnel, announces to Discord, then execs claude.
+# copy it from this repo into your project (or COPY from the claudebot
+# image: COPY --from=claudebot /usr/local/bin/dev-entrypoint.sh ...)
+COPY dev-entrypoint.sh /usr/local/bin/dev-entrypoint.sh
+RUN chmod +x /usr/local/bin/dev-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/dev-entrypoint.sh"]
+```
+
+(see `~/evident/Dockerfile.dev` for a real example that adds rust + a
+pinned Z3 on top of this pattern)
 
 > **First container run only:** the container has its own claude login
 > (macOS keychain credentials don't carry over). You'll be attached to the
