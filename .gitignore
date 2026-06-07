@@ -4,3 +4,5 @@ __pycache__/
 workspace/
 .claudebot
 container-home/
+logs/
+ps-preview.png

@@ -133,10 +133,12 @@ RUN apt-get update && apt-get install -y curl ca-certificates git \
 | Command | Effect |
 | --- | --- |
 | `!new` | Start a fresh claude session (same directory) |
-| `!esc` | Send Escape (interrupt Claude mid-turn) |
+| `!esc` | Interrupt Claude: escapes until the prompt returns (backs out of rewind if overshot) |
+| `!bg` | Ctrl+B: move the currently running Bash tool to the background so the turn (and your queued messages) proceed immediately |
 | `!peek` | Show the live claude TUI pane in a code block |
+| `!ps` | Live embed: process tree (CPU%, memory, elapsed) plus a CPU/RSS line chart of the last hour (image refreshed ~30s, ~3KB). Tree updates every 5s; removed when Claude replies. Also opens itself (30s refresh) when a turn has shown no visible activity for 2 minutes. Resource usage is sampled every 10s continuously, so the chart has history from before the monitor opened |
 | `!status` | Embed card: workspace, session, container, transcript activity |
-| anything else | Forwarded to Claude |
+| anything else | Forwarded to Claude — including **mid-turn**: messages sent while Claude works are queued (📨 reaction) and read between tool calls, with full context |
 
 While Claude works, your message gets a 👀 reaction and the bot shows the
 typing indicator. A single **status message** appears when tools start

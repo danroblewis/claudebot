@@ -26,13 +26,14 @@ import argparse
 import asyncio
 import io
 import json
+import logging
+import logging.handlers
 import os
 import re
 import shlex
 import subprocess
 import sys
 import time
-import traceback
 import uuid
 from collections import deque
 from pathlib import Path
@@ -54,8 +55,28 @@ CONFIG_KEYS = ("DISCORD_TOKEN", "CHANNEL_ID", "USER_ID", "TMUX_SESSION",
                "CONTAINER", "CONTAINER_IMAGE", "DOCKERFILE")
 
 
+LOG = logging.getLogger("claudebot")
+
+
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    if LOG.handlers:  # bridge mode: real logging
+        LOG.info(msg)
+    else:             # launcher mode: plain terminal output
+        print(msg, flush=True)
+
+
+def setup_logging(tmux_session: str) -> None:
+    """Bridge logging: rotating file in logs/ plus stdout (the tmux window)."""
+    logs_dir = SCRIPT_DIR / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+    file_handler = logging.handlers.RotatingFileHandler(
+        logs_dir / f"{tmux_session}.log", maxBytes=5_000_000, backupCount=3)
+    stream_handler = logging.StreamHandler()
+    for handler in (file_handler, stream_handler):
+        handler.setFormatter(fmt)
+        LOG.addHandler(handler)
+    LOG.setLevel(logging.INFO)
 
 
 def resolve_config(opts) -> dict:
@@ -131,18 +152,19 @@ def resolve_resume(claude_args: list[str], cfg: dict, work_dir: str):
     args = list(claude_args)
     resume_id = None
     wants_resume = False
-    if "--resume" in args:
+    for flag in ("--resume", "-resume", "-r"):
+        if flag in args:
+            wants_resume = True
+            i = args.index(flag)
+            nxt = args[i + 1] if i + 1 < len(args) else None
+            if nxt and re.fullmatch(r"[0-9a-fA-F-]{36}", nxt):
+                resume_id = nxt
+                del args[i:i + 2]
+            else:
+                del args[i]
+    if any(f in args for f in ("-c", "--continue", "-continue")):
         wants_resume = True
-        i = args.index("--resume")
-        nxt = args[i + 1] if i + 1 < len(args) else None
-        if nxt and re.fullmatch(r"[0-9a-fA-F-]{36}", nxt):
-            resume_id = nxt
-            del args[i:i + 2]
-        else:
-            del args[i]
-    if "-c" in args or "--continue" in args:
-        wants_resume = True
-        args = [a for a in args if a not in ("-c", "--continue")]
+        args = [a for a in args if a not in ("-c", "--continue", "-continue")]
     if wants_resume and resume_id is None:
         resume_id = latest_session_id(cfg, work_dir)
         if resume_id is None:
@@ -158,6 +180,7 @@ def claude_command(state: dict) -> str:
     if container_enabled(cfg):
         wd = state["work_dir"]
         cmd = ["docker", "run", "--rm", "-it",
+               "--init",  # tini as PID 1 to reap zombies (claude isn't an init system)
                "--name", container_name(cfg["TMUX_SESSION"]),
                "-e", "IS_SANDBOX=1",
                # so in-container tooling (e.g. entrypoint scripts) can post
@@ -359,6 +382,172 @@ async def tmux(*args: str, input_bytes: bytes | None = None) -> int:
     return proc.returncode
 
 
+async def run_out(*args: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    return out.decode(errors="replace")
+
+
+# infrastructure we run ourselves — not Claude's tool subprocesses
+PS_INFRA = ("md -depth", "cloudflared tunnel", "dev-entrypoint")
+
+
+def human_mem(rss_kb: int) -> str:
+    if rss_kb >= 1048576:
+        return f"{rss_kb / 1048576:.1f}G"
+    if rss_kb >= 1024:
+        return f"{rss_kb // 1024}M"
+    return f"{rss_kb}K"
+
+
+def human_etime(etime: str) -> str:
+    """ps etime ([[dd-]hh:]mm:ss) -> '17m', '1h02m', '3d4h'."""
+    days, rest = (etime.split("-") + [""])[:2] if "-" in etime else ("0", etime)
+    parts = [int(p) for p in rest.split(":")]
+    h, m, s = ([0] * (3 - len(parts)) + parts)
+    d = int(days)
+    if d:
+        return f"{d}d{h}h"
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def parse_ps(ps_output: str, session_id: str):
+    """Parse `ps -o pid,ppid,pcpu,rss,etime,args` output. Returns
+    (procs, children, claude_pid) where claude is found by session id."""
+    procs: dict[int, tuple] = {}
+    children: dict[int, list[int]] = {}
+    claude_pid = None
+    for line in ps_output.splitlines()[1:]:
+        parts = line.split(None, 5)
+        if len(parts) < 6 or not parts[0].isdigit():
+            continue
+        pid, ppid = int(parts[0]), int(parts[1])
+        cmd = " ".join(parts[5].split())
+        procs[pid] = (float(parts[2]), int(parts[3]) if parts[3].isdigit() else 0,
+                      parts[4], cmd)
+        children.setdefault(ppid, []).append(pid)
+        if claude_pid is None and session_id in cmd and "docker" not in cmd:
+            claude_pid = pid
+    return procs, children, claude_pid
+
+
+def ps_totals(ps_output: str, session_id: str) -> tuple[float, int] | None:
+    """(total CPU %, total RSS KB) for claude + tool subprocesses."""
+    procs, children, claude_pid = parse_ps(ps_output, session_id)
+    if claude_pid is None:
+        return None
+    cpu_total, rss_total = 0.0, 0
+    def walk(pid: int) -> None:
+        nonlocal cpu_total, rss_total
+        cpu, rss, _, cmd = procs[pid]
+        if pid != claude_pid and (any(p in cmd for p in PS_INFRA) or "<defunct>" in cmd):
+            return
+        cpu_total += cpu
+        rss_total += rss
+        for kid in children.get(pid, []):
+            walk(kid)
+    walk(claude_pid)
+    return cpu_total, rss_total
+
+
+# Discord dark-theme embed colors
+CHART_BG = "#2b2d31"      # embed background — chart blends in seamlessly
+CHART_FG = "#80848e"      # Discord secondary text
+CHART_CPU = "#f0b132"     # 🟨
+CHART_RSS = "#5865f2"     # 🟦
+
+
+def render_chart(samples) -> bytes:
+    """Tiny PNG matching Discord's dark embed: CPU% + RSS over time.
+    Axis titles/legend live in the embed footer (text is cheaper than
+    pixels); palette quantization keeps the file ~5KB."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    now = samples[-1][0]
+    xs = [(s[0] - now) / 60 for s in samples]  # minutes ago (<= 0)
+    cpu = [s[1] for s in samples]
+    rss = [s[2] / 1048576 for s in samples]    # GB
+    fig, ax1 = plt.subplots(figsize=(5.8, 1.7), dpi=80)
+    fig.patch.set_facecolor(CHART_BG)
+    ax1.set_facecolor(CHART_BG)
+    ax2 = ax1.twinx()
+    ax1.plot(xs, cpu, color=CHART_CPU, linewidth=1.2)
+    ax2.plot(xs, rss, color=CHART_RSS, linewidth=1.2)
+    ax1.set_ylim(bottom=0)
+    ax2.set_ylim(bottom=0)
+    ax1.locator_params(axis="y", nbins=4)
+    ax2.locator_params(axis="y", nbins=4)
+    ax1.locator_params(axis="x", nbins=7)
+    for ax, color in ((ax1, CHART_CPU), (ax2, CHART_RSS)):
+        ax.tick_params(labelsize=7, colors=CHART_FG)
+        for label in ax.get_yticklabels():
+            label.set_color(color)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+    ax1.grid(True, color="#404249", linewidth=0.4, alpha=0.5)
+    fig.tight_layout(pad=0.3)
+    raw = io.BytesIO()
+    fig.savefig(raw, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    # palette-quantize: line charts have few colors, so this halves the size
+    raw.seek(0)
+    img = Image.open(raw).convert("RGB").quantize(colors=32)
+    out = io.BytesIO()
+    img.save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+
+def format_ps_tree(ps_output: str, session_id: str) -> str:
+    """Markdown tree of the claude process (found by its session id on the
+    command line) and its descendants, minus our own infra."""
+    procs, children, claude_pid = parse_ps(ps_output, session_id)
+    if claude_pid is None:
+        return "❓ couldn't find the claude process"
+
+    def heat(cpu: float) -> str:
+        return "🔥" if cpu >= 50 else "⚙️" if cpu >= 5 else "💤"
+
+    def fmt(pid: int, depth: int, label: str | None = None) -> str:
+        cpu, rss, etime, cmd = procs[pid]
+        if label is None:
+            argv = cmd.split()
+            label = f"**{Path(argv[0]).name}**"
+            args = " ".join(argv[1:])[:40]
+            if args:
+                label += f" `{args}`"
+        indent = "   " * depth + ("└─ " if depth else "")
+        return (f"{indent}{heat(cpu)} {label} — "
+                f"{cpu:.0f}% · {human_mem(rss)} · {human_etime(etime)}")
+
+    lines = [fmt(claude_pid, 0, "**claude**")]
+    zombies = 0
+    def walk(pid: int, depth: int) -> None:
+        nonlocal zombies
+        for kid in sorted(children.get(pid, [])):
+            cmd = procs[kid][3]
+            if any(p in cmd for p in PS_INFRA):
+                continue
+            if "<defunct>" in cmd:  # dead, awaiting reaping — fold into a count
+                zombies += 1
+                continue
+            lines.append(fmt(kid, depth))
+            walk(kid, depth + 1)
+    walk(claude_pid, 1)
+    if len(lines) == 1:
+        lines.append("   💤 no subprocesses running")
+    if zombies:
+        lines.append(f"   💀 {zombies} defunct (already dead, pending reaping)")
+    return "\n".join(lines)
+
+
 class ClaudeSession:
     """Talks to the claude TUI window; session metadata lives in the state file."""
 
@@ -397,19 +586,45 @@ class ClaudeSession:
         await asyncio.sleep(0.3)
         await tmux("send-keys", "-t", claude_win(self.name), "Enter")
 
+    async def background_tool(self) -> None:
+        """Ctrl+B: move the currently running Bash tool to the background so
+        the turn continues (and queued messages get read) immediately."""
+        await tmux("send-keys", "-t", claude_win(self.name), "C-b")
+
     async def interrupt(self) -> None:
-        await tmux("send-keys", "-t", claude_win(self.name), "Escape")
+        """Escape until the turn actually stops. The number of escapes needed
+        varies, so: send while the pane says "esc to interrupt" (max ~5s),
+        then if we overshot into the rewind panel, one more Escape exits it."""
+        sent = 0
+        for _ in range(10):
+            if "esc to interrupt" not in (await self.capture()).lower():
+                break
+            await tmux("send-keys", "-t", claude_win(self.name), "Escape")
+            sent += 1
+            await asyncio.sleep(0.5)
+        if not sent:  # wasn't visibly working; send one anyway
+            await tmux("send-keys", "-t", claude_win(self.name), "Escape")
+        await asyncio.sleep(0.4)
+        if "rewind" in (await self.capture()).lower():
+            await tmux("send-keys", "-t", claude_win(self.name), "Escape")
 
     async def capture(self) -> str:
         """Return the visible contents of the claude TUI pane."""
-        proc = await asyncio.create_subprocess_exec(
-            "tmux", "capture-pane", "-p", "-t", claude_win(self.name),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await proc.communicate()
-        lines = [ln.rstrip() for ln in out.decode(errors="replace").splitlines()]
+        out = await run_out("tmux", "capture-pane", "-p", "-t", claude_win(self.name))
+        lines = [ln.rstrip() for ln in out.splitlines()]
         while lines and not lines[-1]:
             lines.pop()
         return "\n".join(lines)
+
+    async def ps_output(self) -> str:
+        if container_enabled(self.config):
+            return await run_out("docker", "exec", container_name(self.name),
+                                 "ps", "-eo", "pid,ppid,pcpu,rss,etime,args")
+        return await run_out("ps", "-axo", "pid,ppid,pcpu,rss,etime,args")
+
+    async def process_tree(self) -> str:
+        """Markdown tree: claude + its tool subprocesses with CPU/mem/elapsed."""
+        return format_ps_tree(await self.ps_output(), self.state["session_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +670,7 @@ class TranscriptWatcher:
             try:
                 await self.tick()
             except Exception:
-                traceback.print_exc()
+                LOG.exception("transcript watcher tick failed")
             await asyncio.sleep(POLL_INTERVAL)
 
     async def tick(self) -> None:
@@ -571,6 +786,7 @@ def chunk_message(text: str, limit: int = DISCORD_LIMIT) -> list[str]:
 def run_bridge(tmux_session: str) -> None:
     import discord
 
+    setup_logging(tmux_session)
     state = load_state(tmux_session)
     if not state:
         sys.exit(f"claudebot: no state file for tmux session '{tmux_session}'")
@@ -584,10 +800,11 @@ def run_bridge(tmux_session: str) -> None:
     client = discord.Client(intents=intents)
     watcher_started = False
 
-    WORKING = "👀"  # added to forwarded messages, removed when the turn ends
-    pending: list[discord.Message] = []
+    WORKING = "👀"  # fresh turn; 📨 = queued into an already-running turn
+    pending: list[tuple[discord.Message, str]] = []
     turn_done = asyncio.Event()
     typing_task: asyncio.Task | None = None
+    watcher: TranscriptWatcher | None = None
 
     async def get_chan():
         return client.get_channel(channel_id) or await client.fetch_channel(channel_id)
@@ -596,17 +813,131 @@ def run_bridge(tmux_session: str) -> None:
         minutes, secs = divmod(int(seconds), 60)
         return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
 
+    # --- outbound queue: serialized, paced, retried ------------------------
+    # The watcher consumes transcript bytes exactly once, so a failed send
+    # must never bubble up and lose the message. Everything user-visible goes
+    # through here; a single consumer preserves order.
+    out_q: asyncio.Queue = asyncio.Queue()
+    SEND_ATTEMPTS = 6
+
+    def enqueue(content: str | None = None, embed=None,
+                file_bytes: bytes | None = None, filename: str | None = None) -> None:
+        out_q.put_nowait({"content": content, "embed": embed,
+                          "file_bytes": file_bytes, "filename": filename})
+
+    async def sender_loop() -> None:
+        while True:
+            item = await out_q.get()
+            for attempt in range(1, SEND_ATTEMPTS + 1):
+                try:
+                    channel = await get_chan()
+                    file = (discord.File(io.BytesIO(item["file_bytes"]), item["filename"])
+                            if item["file_bytes"] is not None else discord.utils.MISSING)
+                    await channel.send(item["content"],
+                                       embed=item["embed"] or discord.utils.MISSING,
+                                       file=file)
+                    if attempt > 1:
+                        LOG.info(f"send succeeded on attempt {attempt}")
+                    break
+                except Exception as err:
+                    wait = min(2 ** attempt, 30)
+                    LOG.warning(f"send failed (attempt {attempt}/{SEND_ATTEMPTS}): "
+                                f"{type(err).__name__}: {err} — retrying in {wait}s")
+                    await asyncio.sleep(wait)
+            else:
+                LOG.error(f"DROPPED message after {SEND_ATTEMPTS} attempts: "
+                          f"{str(item['content'])[:120]!r}")
+            await asyncio.sleep(0.3)  # gentle pacing under discord.py's own limiter
+
+    # --- live !ps embed: auto-updates until Claude actually replies -------
+    ps_msg: discord.Message | None = None
+    ps_task: asyncio.Task | None = None
+    last_activity = time.time()
+
+    def touch() -> None:
+        nonlocal last_activity
+        last_activity = time.time()
+
+    # continuous resource sampling so a freshly opened monitor has history
+    samples: deque = deque(maxlen=360)  # (t, cpu%, rss_kb); 1h at 10s
+
+    async def sampler() -> None:
+        while True:
+            try:
+                totals = ps_totals(await session.ps_output(),
+                                   session.state["session_id"])
+                if totals:
+                    samples.append((time.time(), *totals))
+            except Exception:
+                pass  # container down between sessions etc.
+            await asyncio.sleep(10)
+
+    async def ps_updater(interval: float = 5, max_ticks: int = 120) -> None:
+        nonlocal ps_msg
+        chart_every = max(1, round(30 / interval))  # re-render image every ~30s
+        try:
+            for tick in range(max_ticks):
+                try:
+                    tree = (await session.process_tree())[:4000]
+                    embed = discord.Embed(color=0x5865F2, description=tree)
+                    embed.set_footer(text="🟨 CPU % · 🟦 RSS GB · x = minutes ago · "
+                                          f"updates every {interval:.0f}s · "
+                                          "cleared when Claude replies")
+                    new_chart = None
+                    if len(samples) >= 2 and tick % chart_every == 0:
+                        png = await asyncio.to_thread(render_chart, list(samples))
+                        new_chart = discord.File(io.BytesIO(png), "ps.png")
+                    if new_chart is not None:
+                        embed.set_image(url="attachment://ps.png")
+                        if ps_msg is None:
+                            ps_msg = await (await get_chan()).send(embed=embed, file=new_chart)
+                        else:
+                            await ps_msg.edit(embed=embed, attachments=[new_chart])
+                    else:
+                        if ps_msg is not None and ps_msg.attachments:
+                            embed.set_image(url="attachment://ps.png")  # keep old chart
+                        if ps_msg is None:
+                            ps_msg = await (await get_chan()).send(embed=embed)
+                        else:
+                            await ps_msg.edit(embed=embed)
+                except discord.HTTPException as err:
+                    LOG.warning(f"ps embed update failed: {err}")  # retry next tick
+                await asyncio.sleep(interval)
+            # lifetime expired naturally: don't leave a stale embed behind
+            if ps_msg is not None:
+                try:
+                    await ps_msg.delete()
+                except discord.HTTPException:
+                    pass
+                ps_msg = None
+        except asyncio.CancelledError:
+            pass
+
+    async def clear_ps() -> None:
+        nonlocal ps_msg, ps_task
+        if ps_task is not None:
+            ps_task.cancel()
+            ps_task = None
+        if ps_msg is not None:
+            try:
+                await ps_msg.delete()
+            except discord.HTTPException:
+                pass
+            ps_msg = None
+
     async def relay(text: str) -> None:
-        channel = await get_chan()
+        touch()
+        await clear_ps()  # a real reply supersedes the live process view
         chunks = chunk_message(text)
         if len(chunks) > 5:  # multi-page reply: attach as a file, don't spam
             preview = chunk_message(text, 1800)[0]
-            await channel.send(
-                f"{preview}\n-# 📄 long reply — full text attached ({len(text):,} chars)",
-                file=discord.File(io.BytesIO(text.encode()), "reply.md"))
+            LOG.info(f"relay: {len(text):,} chars as file attachment")
+            enqueue(f"{preview}\n-# 📄 long reply — full text attached ({len(text):,} chars)",
+                    file_bytes=text.encode(), filename="reply.md")
             return
+        LOG.info(f"relay: {len(text):,} chars in {len(chunks)} chunk(s)")
         for chunk in chunks:
-            await channel.send(chunk)
+            enqueue(chunk)
 
     # --- live tool-status message: one message edited as tools run -------
     tool_log: deque[str] = deque(maxlen=5)
@@ -618,6 +949,7 @@ def run_bridge(tmux_session: str) -> None:
 
     async def on_tool(desc: str) -> None:
         nonlocal status_msg, last_status_edit
+        touch()
         tool_log.append(desc)
         try:
             if status_msg is None:
@@ -641,6 +973,8 @@ def run_bridge(tmux_session: str) -> None:
         tool_log.clear()
 
     async def on_turn_end(stats: dict) -> None:
+        LOG.info(f"turn end: {fmt_duration(stats['seconds'])}, "
+                 f"{stats['tools']} tools, {stats['output_tokens']:,} output tokens")
         await finalize_status(f"-# ✅ {fmt_duration(stats['seconds'])} · "
                               f"{stats['tools']} tool calls · "
                               f"{stats['output_tokens']:,} output tokens")
@@ -649,9 +983,9 @@ def run_bridge(tmux_session: str) -> None:
     async def clear_working() -> None:
         turn_done.set()  # stops the typing indicator
         while pending:
-            msg = pending.pop()
+            msg, emoji = pending.pop()
             try:
-                await msg.remove_reaction(WORKING, client.user)
+                await msg.remove_reaction(emoji, client.user)
             except discord.HTTPException:
                 pass
 
@@ -664,22 +998,45 @@ def run_bridge(tmux_session: str) -> None:
 
     def begin_turn() -> None:
         nonlocal typing_task
+        touch()
         turn_done.clear()
         if typing_task is None or typing_task.done():
             typing_task = asyncio.create_task(typing_until_done())
 
     @client.event
     async def on_ready() -> None:
-        nonlocal watcher_started
+        nonlocal watcher_started, watcher
         log(f"Logged in as {client.user}; bridging {session.work_dir} "
             f"<-> channel {channel_id}")
         if not watcher_started:
             watcher_started = True
-            asyncio.create_task(TranscriptWatcher(
-                session, relay, on_turn_end=on_turn_end, on_tool=on_tool).run())
+            watcher = TranscriptWatcher(
+                session, relay, on_turn_end=on_turn_end, on_tool=on_tool)
+            asyncio.create_task(sender_loop())
+            asyncio.create_task(watcher.run())
+            asyncio.create_task(idle_watchdog(watcher))
+            asyncio.create_task(sampler())
+
+    IDLE_AFTER = 120  # auto-open the process monitor after 2 quiet minutes
+
+    async def idle_watchdog(watcher: TranscriptWatcher) -> None:
+        nonlocal ps_task
+        while True:
+            await asyncio.sleep(15)
+            try:
+                mid_turn = watcher.turn_started is not None
+                quiet = time.time() - last_activity > IDLE_AFTER
+                ps_idle = ps_msg is None and (ps_task is None or ps_task.done())
+                if mid_turn and quiet and ps_idle:
+                    LOG.info(f"no visible activity for {IDLE_AFTER}s mid-turn — "
+                             "auto-opening process monitor (30s refresh)")
+                    ps_task = asyncio.create_task(ps_updater(interval=30, max_ticks=240))
+            except Exception:
+                LOG.exception("idle watchdog error")
 
     @client.event
     async def on_message(message: discord.Message) -> None:
+        nonlocal ps_task
         if message.author.bot:
             return
         if message.channel.id != channel_id or message.author.id != user_id:
@@ -688,20 +1045,33 @@ def run_bridge(tmux_session: str) -> None:
         if not content and not message.attachments:
             return
         if content == "!new":
+            LOG.info("command: !new")
             await session.start_fresh()
             await finalize_status("-# 🆕 session restarted")
             await clear_working()
-            await message.channel.send("🆕 Started a fresh Claude session.")
+            await clear_ps()
+            enqueue("🆕 Started a fresh Claude session.")
             return
         if content == "!esc":
+            LOG.info("command: !esc")
             await session.interrupt()
             await finalize_status("-# 🛑 interrupted")
             await clear_working()  # interrupted turns never write end_turn
+            await clear_ps()
             await message.add_reaction("🛑")
+            return
+        if content == "!bg":
+            LOG.info("command: !bg")
+            await session.background_tool()
+            await message.add_reaction("⏬")
             return
         if content == "!peek":
             pane = (await session.capture()).replace("```", "`​``")
-            await message.channel.send(f"```\n{pane[-1900:] or '(empty pane)'}\n```")
+            enqueue(f"```\n{pane[-1900:] or '(empty pane)'}\n```")
+            return
+        if content == "!ps":
+            await clear_ps()  # restart fresh if one is already live
+            ps_task = asyncio.create_task(ps_updater())
             return
         if content == "!status":
             embed = discord.Embed(title="claudebot", color=0xCC785C)
@@ -720,7 +1090,7 @@ def run_bridge(tmux_session: str) -> None:
                                 value=f"{stat.st_size // 1024} KB · active "
                                       f"{fmt_duration(time.time() - stat.st_mtime)} ago",
                                 inline=True)
-            await message.channel.send(embed=embed)
+            enqueue(embed=embed)
             return
 
         parts = [message.content] if content else []
@@ -743,11 +1113,15 @@ def run_bridge(tmux_session: str) -> None:
                              + "\n".join(saved))
         if not parts:
             return
+        LOG.info(f"forward -> claude: {len(content)} chars"
+                 + (f", {len(message.attachments)} attachment(s)" if message.attachments else ""))
+        mid_turn = watcher is not None and watcher.turn_started is not None
         await session.send("\n\n".join(parts))
         begin_turn()
         try:
-            await message.add_reaction(WORKING)
-            pending.append(message)
+            emoji = "📨" if mid_turn else WORKING  # queued into a running turn?
+            await message.add_reaction(emoji)
+            pending.append((message, emoji))
         except discord.HTTPException:
             pass  # cosmetic only — the message was already delivered
 
