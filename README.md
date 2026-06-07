@@ -1,0 +1,152 @@
+# claudebot
+
+A personal Discord ↔ Claude Code bridge. `cd` into any project and run
+`claudebot`: it starts an interactive `claude` session in tmux, attaches you to
+it, and bridges it to a Discord channel — messages you post there are pasted
+into the session, and Claude's prose replies are relayed back by tailing the
+JSONL transcript under `~/.claude/projects`.
+
+## Usage
+
+```sh
+cd ~/my_project
+claudebot [options] [claude options...]   # start (or re-attach) and attach
+claudebot --continue                      # resume this dir's latest session
+claudebot --resume <session-id>           # resume a specific session
+claudebot --stop                          # tear everything down
+```
+
+Detaching (`ctrl-b d`) never loses anything — the session keeps running and
+`claudebot` re-attaches. After a real `--stop` (or reboot), `claudebot`
+starts fresh; use `--continue` to pick the old conversation back up (the
+session id is shown by `!status` and in `~/.claudebot-sessions.json`).
+
+Unrecognized options are passed through to claude
+(e.g. `claudebot --model opus`). Detach with `ctrl-b d`; everything keeps
+running and stays usable from Discord. Running `claudebot` again in the same
+directory re-attaches; in a different directory it replaces the session
+(unless you give the projects different `TMUX_SESSION` names — then they run
+concurrently, each bridging its own channel).
+
+## Configuration
+
+KEY=VALUE lines, resolved in order (later wins):
+
+1. `~/.claudebot` — global defaults (typically `DISCORD_TOKEN`, `USER_ID`)
+2. `./.claudebot` — per-project (typically `CHANNEL_ID`, `TMUX_SESSION`);
+   add it to the project's `.gitignore`
+3. CLI flags: `--discord-token`, `--channel-id`, `--user-id`, `--tmux-session`
+
+You can also bind by **name** instead of ID: `claudebot --channel evident`
+looks the name up via the bot token across the bot's guilds (text channels
+and active threads; errors with a list if the name is ambiguous).
+
+| Key | Meaning |
+| --- | --- |
+| `DISCORD_TOKEN` | Bot token (Developer Portal → Bot → Token) |
+| `CHANNEL_ID` | Channel **or thread** ID the bridge listens in / replies to |
+| `USER_ID` | Your Discord user ID — only your messages are forwarded |
+| `TMUX_SESSION` | tmux session name (default `claudebot`) |
+| `CONTAINER` | `1` to run claude inside docker (flags: `--container` / `--no-container`) |
+| `CONTAINER_IMAGE` | existing docker image to use as-is (no build) |
+| `DOCKERFILE` | Dockerfile to build the container image from |
+
+## Container mode
+
+`claudebot --container` (or `CONTAINER=1` in a `.claudebot` file) runs the
+claude process inside a docker container **as root**, so it can `apt-get
+install` / `npm i -g` whatever it needs without touching the host:
+
+- the project dir is bind-mounted at the same path; the bridge stays on the
+  host and everything (attach, Discord, `!new`, `!esc`) works the same
+- `container-home/` is mounted at `/root`, so claude's login and dotfiles
+  persist across sessions; system-level installs last for one session
+- `IS_SANDBOX=1` is passed so claude permits `--dangerously-skip-permissions`
+  as root
+
+The image is chosen in this order:
+
+1. `CONTAINER_IMAGE` / `--container-image` — an existing image, used as-is
+2. `DOCKERFILE` / `--dockerfile` — built (tagged `claudebot-<project-name>`)
+3. `./Dockerfile` in the project — built automatically, same tag
+4. the bundled `Dockerfile` — built as `claudebot` (the node base is only
+   because Claude Code is an npm package; it's general-purpose Debian)
+
+Builds rerun on every launch, so Dockerfile edits are picked up (docker's
+layer cache makes unchanged builds near-instant).
+
+**Bring-your-own-Dockerfile requirements:** the image must have claude
+installed **outside `/root`** (the `container-home/` mount shadows `/root`
+at runtime — `npm install -g @anthropic-ai/claude-code` lands safely in
+`/usr/local`) and should run as root so the persistent home lines up:
+
+```dockerfile
+FROM ubuntu:24.04   # any base you like
+RUN apt-get update && apt-get install -y curl ca-certificates git \
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y nodejs \
+ && npm install -g @anthropic-ai/claude-code
+```
+
+> **First container run only:** the container has its own claude login
+> (macOS keychain credentials don't carry over). You'll be attached to the
+> TUI — pick a theme and `/login` once; it persists in `container-home/`.
+
+## How it works
+
+- `claudebot` creates a tmux session with two windows: `claude` (the TUI,
+  launched as `claude --session-id <uuid> --dangerously-skip-permissions
+  <your opts>` in the current directory) and `bridge` (the Discord relay;
+  its logs live there — `ctrl-b n` to peek).
+- The fixed session id makes the transcript path deterministic:
+  `~/.claude/projects/<munged-work-dir>/<session-id>.jsonl`.
+- Incoming Discord messages (from your `USER_ID`, in `CHANNEL_ID`) are
+  injected via tmux bracketed paste + Enter.
+- The bridge tails the transcript, picks out assistant `text` blocks (skipping
+  thinking, tool calls, and subagent sidechains), and posts them to the
+  channel, chunked to Discord's 2000-char limit. Turns you type directly in
+  the TUI are relayed to Discord too — it's one shared session.
+
+## Setup
+
+1. **Create the Discord bot** at https://discord.com/developers/applications:
+   - Bot → enable **Message Content Intent** (required)
+   - Copy the bot token
+   - OAuth2 → URL Generator → scope `bot`, permissions *View Channels*,
+     *Send Messages*, *Add Reactions* → invite it to your server
+2. **Configure** `~/.claudebot` (see above; enable Developer Mode in Discord
+   settings to get Copy ID context menus)
+3. **Install**:
+   ```sh
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   printf '#!/bin/sh\nexec %s/.venv/bin/python %s/claudebot.py "$@"\n' "$PWD" "$PWD" \
+     > /opt/homebrew/bin/claudebot && chmod +x /opt/homebrew/bin/claudebot
+   ```
+
+> **First run in a new directory:** claude shows a one-time folder-trust
+> prompt in the TUI. You'll see it since `claudebot` attaches you — answer it
+> once, then Discord messages flow.
+
+## Commands (in the channel)
+
+| Command | Effect |
+| --- | --- |
+| `!new` | Start a fresh claude session (same directory) |
+| `!esc` | Send Escape (interrupt Claude mid-turn) |
+| `!peek` | Show the live claude TUI pane in a code block |
+| `!status` | Embed card: workspace, session, container, transcript activity |
+| anything else | Forwarded to Claude |
+
+While Claude works, your message gets a 👀 reaction and the bot shows the
+typing indicator. A single **status message** appears when tools start
+running and is edited live with the recent tool calls (`🔧 Bash: npm test`),
+then collapses into a one-line summary at turn end
+(`✅ 1m42s · 12 tool calls · 8,341 output tokens`).
+
+Discord **attachments** (images, files) are saved to `/tmp/claudebot-uploads/`
+(mounted into the container in container mode) and their paths are passed to
+Claude with your message — drop a screenshot in the channel and ask about it.
+
+Replies longer than ~5 Discord messages are sent as a preview plus the full
+text attached as `reply.md` instead of a wall of chunks.
