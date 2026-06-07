@@ -133,10 +133,12 @@ RUN apt-get update && apt-get install -y curl ca-certificates git \
 | Command | Effect |
 | --- | --- |
 | `!new` | Start a fresh claude session (same directory) |
+| `!/<command>` | Send any claude slash command — Discord hijacks bare `/`, so `!/compact`, `!/clear`, `!/goal …` etc. TUI-only output is visible via `!peek` |
+| `!tasks` | Claude's task list for the session (🟩 done · 🟨 active · ⬜ pending, with blocker edges), read from `~/.claude/tasks/<session>/` |
 | `!esc` | Interrupt Claude: escapes until the prompt returns (backs out of rewind if overshot) |
 | `!bg` | Ctrl+B: move the currently running Bash tool to the background so the turn (and your queued messages) proceed immediately |
 | `!peek` | Show the live claude TUI pane in a code block |
-| `!ps` | Live embed: process tree (CPU%, memory, elapsed) plus a CPU/RSS line chart of the last hour (image refreshed ~30s, ~3KB). Tree updates every 5s; removed when Claude replies. Also opens itself (30s refresh) when a turn has shown no visible activity for 2 minutes. Resource usage is sampled every 10s continuously, so the chart has history from before the monitor opened |
+| `!ps` | Live activity monitor: a status line (⚡ generating / ⏳ waiting / 💤 idle · context usage · next-update countdown) plus a per-process CPU/RSS chart (~3KB image). Adaptive cadence: 30s → 1m → 5m → 10m → 20m → 30m as metrics stay steady (habituation: significance is judged against the session's recent churn); significant changes, a 🔄 reaction, or any message from you snap it back to 30s. The chart window is the update interval + 10 min, so slow updates show everything since the last one. React ❌ to close; cleared when Claude replies. Auto-opens after 1 message-quiet minute mid-turn (unless tokens are streaming). Sampling runs every 10s continuously |
 | `!status` | Embed card: workspace, session, container, transcript activity |
 | anything else | Forwarded to Claude — including **mid-turn**: messages sent while Claude works are queued (📨 reaction) and read between tool calls, with full context |
 

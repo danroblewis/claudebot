@@ -48,6 +48,7 @@ CONTAINER_HOME = SCRIPT_DIR / "container-home"  # mounted at /root in the contai
 UPLOAD_DIR = Path("/tmp/claudebot-uploads")  # Discord attachments land here
 POLL_INTERVAL = 0.5
 DISCORD_LIMIT = 2000
+CONTEXT_LIMIT = 1_000_000  # assume the 1M context window
 DEFAULT_SESSION = "claudebot"
 DEFAULT_IMAGE = "claudebot"
 
@@ -436,36 +437,120 @@ def parse_ps(ps_output: str, session_id: str):
     return procs, children, claude_pid
 
 
-def ps_totals(ps_output: str, session_id: str) -> tuple[float, int] | None:
-    """(total CPU %, total RSS KB) for claude + tool subprocesses."""
+def ps_by_name(ps_output: str, session_id: str, all_claudes: bool = False) -> dict | None:
+    """{label: (cpu%, rss_kb)} with one entry per process — no aggregation;
+    labels are "name·pid" (pid keeps line identity stable across samples).
+    Roots: the bridged claude — or, with all_claudes (container mode), every
+    claude process, so orchestrator setups with multiple sessions are fully
+    covered. The bridged claude is labeled "claude"; other instances
+    "claude:2", "claude:3", ..."""
     procs, children, claude_pid = parse_ps(ps_output, session_id)
-    if claude_pid is None:
+    parent_of = {kid: p for p, kids in children.items() for kid in kids}
+
+    def cmd_name(cmd: str) -> str:
+        parts = cmd.split()
+        return Path(parts[0]).name if parts else "?"
+
+    claude_pids = {pid for pid, t in procs.items()
+                   if cmd_name(t[3]) == "claude" and "<defunct>" not in t[3]}
+    if claude_pid is not None:
+        claude_pids.add(claude_pid)
+
+    if all_claudes:
+        def under_claude(pid: int) -> bool:
+            parent = parent_of.get(pid)
+            while parent is not None:
+                if parent in claude_pids:
+                    return True
+                parent = parent_of.get(parent)
+            return False
+        roots = sorted(p for p in claude_pids if not under_claude(p))
+    else:
+        roots = [claude_pid] if claude_pid is not None else []
+    if not roots:
         return None
-    cpu_total, rss_total = 0.0, 0
+
+    labels = {p: f"claude:{i + 2}"
+              for i, p in enumerate(sorted(p for p in claude_pids if p != claude_pid))}
+    if claude_pid is not None:
+        labels[claude_pid] = "claude"
+
+    agg: dict[str, tuple[float, int]] = {}
     def walk(pid: int) -> None:
-        nonlocal cpu_total, rss_total
         cpu, rss, _, cmd = procs[pid]
-        if pid != claude_pid and (any(p in cmd for p in PS_INFRA) or "<defunct>" in cmd):
+        if pid not in claude_pids and (any(p in cmd for p in PS_INFRA)
+                                       or "<defunct>" in cmd):
             return
-        cpu_total += cpu
-        rss_total += rss
+        label = labels.get(pid) or f"{cmd_name(cmd)}·{pid}"
+        agg[label] = (cpu, rss)
         for kid in children.get(pid, []):
             walk(kid)
-    walk(claude_pid)
-    return cpu_total, rss_total
+    for root in roots:
+        walk(root)
+    return agg
 
 
 # Discord dark-theme embed colors
 CHART_BG = "#2b2d31"      # embed background — chart blends in seamlessly
 CHART_FG = "#80848e"      # Discord secondary text
-CHART_CPU = "#f0b132"     # 🟨
-CHART_RSS = "#5865f2"     # 🟦
+# line palette, paired with emoji for the text legend in the embed footer
+CHART_COLORS = (("🟨", "#f0b132"), ("🟦", "#5865f2"), ("🟥", "#ed4245"),
+                ("🟩", "#57f287"), ("🟪", "#a55ee8"), ("🟧", "#e67e22"),
+                ("⬜", "#b5bac1"))
 
 
-def render_chart(samples) -> bytes:
-    """Tiny PNG matching Discord's dark embed: CPU% + RSS over time.
-    Axis titles/legend live in the embed footer (text is cheaper than
-    pixels); palette quantization keeps the file ~5KB."""
+def chart_window(samples, seconds: float) -> list:
+    cutoff = samples[-1][0] - seconds
+    return [s for s in samples if s[0] >= cutoff]
+
+
+def window_means(samples, seconds: float = 120) -> dict:
+    """{name: (mean cpu%, mean rss_kb)} over the trailing window; a process
+    absent from a sample counts as 0 (so deaths pull the mean down)."""
+    if not samples:
+        return {}
+    recent = chart_window(samples, seconds)
+    names = {n for _, procs in recent for n in procs}
+    means = {}
+    for name in names:
+        cpus = [procs.get(name, (0.0, 0))[0] for _, procs in recent]
+        rsss = [procs.get(name, (0.0, 0))[1] for _, procs in recent]
+        means[name] = (sum(cpus) / len(recent), sum(rsss) / len(recent))
+    return means
+
+
+def change_score(prev: dict, cur: dict) -> float:
+    """How different the world looks vs the last render. Units: ~1.0 means
+    'a process swung by a full core' or 'half a GB moved'."""
+    score = 0.0
+    for name in set(prev) | set(cur):
+        p_cpu, p_rss = prev.get(name, (0.0, 0))
+        c_cpu, c_rss = cur.get(name, (0.0, 0))
+        score += abs(c_cpu - p_cpu) / 100 + abs(c_rss - p_rss) / 512000
+        if (name in cur) != (name in prev) and max(p_cpu, c_cpu) > 5:
+            score += 0.5  # a real process appeared or vanished
+    return score
+
+
+def chart_fingerprint(samples) -> tuple:
+    """Value signature of the window, timestamp-free and quantized (CPU to
+    1%, RSS to 10MB) — when this is unchanged, the rendered chart would look
+    identical, so the image upload can be skipped (e.g. everything idle)."""
+    return tuple(
+        tuple(sorted((name, round(vals[0]), vals[1] // 10240,
+                      vals[2] if len(vals) > 2 else 1)
+                     for name, vals in procs.items()))
+        for _, procs in samples
+    )
+
+
+def render_chart(samples) -> tuple[bytes, str]:
+    """Side-by-side panels (CPU% left, RSS right), one line per process that
+    showed CPU > 0 anywhere in the window. CPU axis spans at least 0-100%
+    but expands for multi-core (>100%) processes; RSS axis tops out at
+    observed max but never below 100MB.
+    Returns (png, footer line) — legend text is cheaper than pixels.
+    samples = [(t, {name: (cpu, rss_kb)})]."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -473,36 +558,76 @@ def render_chart(samples) -> bytes:
 
     now = samples[-1][0]
     xs = [(s[0] - now) / 60 for s in samples]  # minutes ago (<= 0)
-    cpu = [s[1] for s in samples]
-    rss = [s[2] / 1048576 for s in samples]    # GB
-    fig, ax1 = plt.subplots(figsize=(5.8, 1.7), dpi=80)
+    peak: dict[str, float] = {}
+    peak_rss_mb = 0.0
+    for _, procs in samples:
+        for label, vals in procs.items():
+            peak[label] = max(peak.get(label, 0.0), vals[0])
+            peak_rss_mb = max(peak_rss_mb, vals[1] / 1024)
+    # lines are per-PID ("name·pid"), but color and legend group by name
+    def group_of(label: str) -> str:
+        return label.rsplit("·", 1)[0]
+    group_peak: dict[str, float] = {}
+    members: dict[str, list[str]] = {}
+    for label, p in peak.items():
+        if p <= 0:
+            continue
+        grp = group_of(label)
+        group_peak[grp] = max(group_peak.get(grp, 0.0), p)
+        members.setdefault(grp, []).append(label)
+    active_groups = sorted(group_peak, key=lambda g: -group_peak[g])
+    shown_groups = active_groups[:len(CHART_COLORS)]
+    shown = [lbl for grp in shown_groups for lbl in members[grp]]
+
+    rss_max_mb = max(100.0, peak_rss_mb * 1.05)  # minimum-max 100MB
+    use_gb = rss_max_mb >= 1000
+    rss_div = 1048576 if use_gb else 1024  # kb -> GB or MB
+    rss_unit = "GB" if use_gb else "MB"
+    # CPU axis: floor of 100%, but expands so multi-core processes (>100%)
+    # stay on screen instead of clipping at the ceiling
+    cpu_max = max([100.0] + [peak[lbl] * 1.05 for lbl in shown])
+
+    fig, (ax_cpu, ax_rss) = plt.subplots(1, 2, figsize=(5.8, 1.6), dpi=80)
     fig.patch.set_facecolor(CHART_BG)
-    ax1.set_facecolor(CHART_BG)
-    ax2 = ax1.twinx()
-    ax1.plot(xs, cpu, color=CHART_CPU, linewidth=1.2)
-    ax2.plot(xs, rss, color=CHART_RSS, linewidth=1.2)
-    ax1.set_ylim(bottom=0)
-    ax2.set_ylim(bottom=0)
-    ax1.locator_params(axis="y", nbins=4)
-    ax2.locator_params(axis="y", nbins=4)
-    ax1.locator_params(axis="x", nbins=7)
-    for ax, color in ((ax1, CHART_CPU), (ax2, CHART_RSS)):
+    nan = float("nan")
+    for (_, color), grp in zip(CHART_COLORS, shown_groups):
+        for label in members[grp]:
+            cpu_series = [s[1][label][0] if label in s[1] else nan for s in samples]
+            rss_series = [s[1][label][1] / rss_div if label in s[1] else nan for s in samples]
+            # markers so short-lived processes (isolated samples between NaN
+            # gaps) are still visible as dots
+            ax_cpu.plot(xs, cpu_series, color=color, linewidth=1.2,
+                        marker=".", markersize=2.2)
+            ax_rss.plot(xs, rss_series, color=color, linewidth=1.2,
+                        marker=".", markersize=2.2)
+    ax_cpu.set_ylim(0, cpu_max)
+    ax_rss.set_ylim(0, rss_max_mb / (1024 if use_gb else 1))
+    for ax in (ax_cpu, ax_rss):
+        ax.set_facecolor(CHART_BG)
+        ax.locator_params(axis="y", nbins=4)
+        ax.locator_params(axis="x", nbins=5)
         ax.tick_params(labelsize=7, colors=CHART_FG)
-        for label in ax.get_yticklabels():
-            label.set_color(color)
         for spine in ax.spines.values():
             spine.set_visible(False)
-    ax1.grid(True, color="#404249", linewidth=0.4, alpha=0.5)
-    fig.tight_layout(pad=0.3)
+        ax.grid(True, color="#404249", linewidth=0.4, alpha=0.5)
+    fig.tight_layout(pad=0.3, w_pad=1.0)
+
     raw = io.BytesIO()
     fig.savefig(raw, format="png", facecolor=fig.get_facecolor())
     plt.close(fig)
     # palette-quantize: line charts have few colors, so this halves the size
     raw.seek(0)
-    img = Image.open(raw).convert("RGB").quantize(colors=32)
+    img = Image.open(raw).convert("RGB").quantize(colors=48)
     out = io.BytesIO()
     img.save(out, "PNG", optimize=True)
-    return out.getvalue()
+
+    legend = " · ".join(
+        f"{emoji} {grp}" + (f" ×{len(members[grp])}" if len(members[grp]) > 1 else "")
+        for (emoji, _), grp in zip(CHART_COLORS, shown_groups))
+    if len(active_groups) > len(shown_groups):
+        legend += f" · +{len(active_groups) - len(shown_groups)} more"
+    footer = f"{legend} · left CPU % · right RSS {rss_unit} · x = min ago"
+    return out.getvalue(), footer
 
 
 def format_ps_tree(ps_output: str, session_id: str) -> str:
@@ -631,6 +756,75 @@ class ClaudeSession:
 # Transcript watcher
 # ---------------------------------------------------------------------------
 
+TASK_ICONS = {"completed": "🟩", "in_progress": "🟨", "pending": "⬜",
+              "cancelled": "⬛", "blocked": "🟥"}
+
+
+def load_tasks(cfg: dict, session_id: str) -> list[dict]:
+    """Claude Code's task list: ~/.claude/tasks/<session-id>/N.json."""
+    home = CONTAINER_HOME if container_enabled(cfg) else Path.home()
+    task_dir = home / ".claude" / "tasks" / session_id
+    tasks = []
+    for path in task_dir.glob("*.json") if task_dir.is_dir() else []:
+        try:
+            task = json.loads(path.read_text())
+            if isinstance(task, dict) and task.get("subject"):
+                tasks.append(task)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return sorted(tasks, key=lambda t: (len(str(t.get("id", ""))), str(t.get("id", ""))))
+
+
+def render_tasks(tasks: list[dict]) -> str:
+    if not tasks:
+        return "no tasks in this session"
+    done = sum(1 for t in tasks if t.get("status") == "completed")
+    lines = [f"**Tasks** ({done}/{len(tasks)} done)"]
+    for t in tasks:
+        icon = TASK_ICONS.get(t.get("status"), "❔")
+        subject = str(t.get("subject", ""))[:90]
+        line = f"{icon} {t.get('id', '?')} {subject}"
+        if t.get("blockedBy"):
+            line += f" · ← {','.join(str(b) for b in t['blockedBy'])}"
+        lines.append(line)
+    out = "\n".join(lines)
+    return out[:1990] + "…" if len(out) > 1995 else out
+
+
+def context_from_usage(usage: dict) -> int:
+    """Context consumed by an API call = its full input + output."""
+    return ((usage.get("input_tokens") or 0)
+            + (usage.get("cache_read_input_tokens") or 0)
+            + (usage.get("cache_creation_input_tokens") or 0)
+            + (usage.get("output_tokens") or 0))
+
+
+def fmt_context(tokens: int) -> str:
+    return f"ctx {tokens / 1000:.0f}k/1M ({tokens / CONTEXT_LIMIT:.0%})"
+
+
+def latest_context_tokens(path: Path) -> int | None:
+    """Context size from the newest assistant line in a transcript (reads
+    only the file tail — used when the live watcher hasn't seen a line yet)."""
+    try:
+        with path.open("rb") as f:
+            f.seek(max(0, path.stat().st_size - 262144))
+            data = f.read()
+    except OSError:
+        return None
+    best = None
+    for line in data.splitlines():  # first line may be partial; json skips it
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") == "assistant" and not entry.get("isSidechain"):
+            ctx = context_from_usage(entry.get("message", {}).get("usage") or {})
+            if ctx:
+                best = ctx
+    return best
+
+
 def tool_desc(block: dict) -> str:
     """One-line human description of a tool_use block."""
     name = block.get("name", "tool")
@@ -664,6 +858,8 @@ class TranscriptWatcher:
         self.turn_started: float | None = None
         self.turn_tools = 0
         self.turn_tokens = 0
+        self.context_tokens: int | None = None  # latest API call's total input+output
+        self.sidechain_seen = 0.0  # last time a subagent line streamed
 
     async def run(self) -> None:
         while True:
@@ -704,7 +900,10 @@ class TranscriptWatcher:
             entry = json.loads(line)
         except json.JSONDecodeError:
             return
-        if entry.get("type") != "assistant" or entry.get("isSidechain"):
+        if entry.get("type") != "assistant":
+            return
+        if entry.get("isSidechain"):
+            self.sidechain_seen = time.time()  # a subagent is actively working
             return
         line_uuid = entry.get("uuid")
         if line_uuid:
@@ -723,7 +922,11 @@ class TranscriptWatcher:
         tools = [b for b in content
                  if isinstance(b, dict) and b.get("type") == "tool_use"]
         self.turn_tools += len(tools)
-        self.turn_tokens += (msg.get("usage") or {}).get("output_tokens") or 0
+        usage = msg.get("usage") or {}
+        self.turn_tokens += usage.get("output_tokens") or 0
+        ctx = context_from_usage(usage)
+        if ctx:
+            self.context_tokens = ctx
         if self.on_tool:
             for block in tools:
                 await self.on_tool(tool_desc(block))
@@ -750,6 +953,66 @@ def open_fence(text: str) -> str | None:
         if line.lstrip().startswith("```"):
             fence = None if fence else f"```{line.lstrip()[3:].strip()[:12]}"
     return fence
+
+
+def _is_table_row(line: str) -> bool:
+    s = line.strip()
+    return s.startswith("|") and s.endswith("|") and s.count("|") >= 2
+
+
+def _is_table_separator(line: str) -> bool:
+    s = line.strip()
+    return _is_table_row(line) and set(s) <= set("|-: ")
+
+
+def _render_table(rows: list[str]) -> str:
+    """Markdown table rows -> column-aligned text in a code block."""
+    parsed = []
+    for row in rows:
+        cells = [c.strip().replace("**", "").replace("`", "")
+                 for c in row.strip().strip("|").split("|")]
+        parsed.append(cells)
+    has_separator = len(parsed) > 1 and all(
+        c and set(c) <= set("-: ") for c in parsed[1])
+    if has_separator:
+        parsed.pop(1)
+    ncols = max(len(p) for p in parsed)
+    for p in parsed:
+        p += [""] * (ncols - len(p))
+    widths = [max(len(p[col]) for p in parsed) for col in range(ncols)]
+    def fmt(cells: list[str]) -> str:
+        return "  ".join(c.ljust(w) for c, w in zip(cells, widths)).rstrip()
+    lines = [fmt(parsed[0])]
+    if has_separator:
+        lines.append("  ".join("─" * w for w in widths))
+    lines.extend(fmt(p) for p in parsed[1:])
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+def convert_tables(text: str) -> str:
+    """Discord never renders markdown tables — re-render them as aligned
+    text in code blocks. Tables already inside code fences are left alone."""
+    lines = text.split("\n")
+    out: list[str] = []
+    i, in_fence = 0, False
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if (not in_fence and _is_table_row(line)
+                and i + 1 < len(lines) and _is_table_separator(lines[i + 1])):
+            block = []
+            while i < len(lines) and _is_table_row(lines[i]):
+                block.append(lines[i])
+                i += 1
+            out.append(_render_table(block))
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
 
 
 def chunk_message(text: str, limit: int = DISCORD_LIMIT) -> list[str]:
@@ -849,67 +1112,145 @@ def run_bridge(tmux_session: str) -> None:
                           f"{str(item['content'])[:120]!r}")
             await asyncio.sleep(0.3)  # gentle pacing under discord.py's own limiter
 
-    # --- live !ps embed: auto-updates until Claude actually replies -------
+    # --- live !ps monitor: auto-updates until Claude actually replies ------
     ps_msg: discord.Message | None = None
     ps_task: asyncio.Task | None = None
+    ps_ctl: dict = {}  # {"force": True} -> immediate render + ladder reset
     last_activity = time.time()
 
     def touch() -> None:
         nonlocal last_activity
         last_activity = time.time()
 
-    # continuous resource sampling so a freshly opened monitor has history
-    samples: deque = deque(maxlen=360)  # (t, cpu%, rss_kb); 1h at 10s
+    # --- TUI spinner scrape: are tokens actually streaming right now? ------
+    # The spinner's `↑ N tokens` counter only moves while the model streams
+    # output; it freezes during tool runs / API waits. Granularity above 1k
+    # is 0.1k, which flips every ~1-2s at normal streaming speed.
+    TOKEN_RE = re.compile(r"↑\s*([\d.,]+k?)\s*tokens")
+    token_state = {"value": None, "changed_at": 0.0, "spinner": False}
 
-    async def sampler() -> None:
+    async def tui_poller() -> None:
         while True:
             try:
-                totals = ps_totals(await session.ps_output(),
-                                   session.state["session_id"])
-                if totals:
-                    samples.append((time.time(), *totals))
+                match = TOKEN_RE.search(await session.capture())
+                if match:
+                    token_state["spinner"] = True
+                    if match.group(1) != token_state["value"]:
+                        token_state["value"] = match.group(1)
+                        token_state["changed_at"] = time.time()
+                else:
+                    token_state["spinner"] = False
+                    token_state["value"] = None
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+
+    def generating() -> bool:
+        return token_state["spinner"] and time.time() - token_state["changed_at"] < 10
+
+    # continuous resource sampling so a freshly opened monitor has history
+    samples: deque = deque(maxlen=360)  # (t, {name: (cpu%, rss_kb)}); 1h at 10s
+
+    async def sampler() -> None:
+        in_container = container_enabled(session.config)
+        while True:
+            try:
+                by_name = ps_by_name(await session.ps_output(),
+                                     session.state["session_id"],
+                                     all_claudes=in_container)
+                if by_name is not None:
+                    samples.append((time.time(), by_name))
             except Exception:
                 pass  # container down between sessions etc.
             await asyncio.sleep(10)
 
-    async def ps_updater(interval: float = 5, max_ticks: int = 120) -> None:
+    PS_TICK = 30  # evaluate every 30s; edits follow the decay ladder
+    PS_LADDER = (30, 60, 300, 600, 1200, 1800)  # 30s -> 1m -> 5m -> ... -> 30m
+    # the reaction shows the current cadence; tapping it snaps back to ⚡
+    SPEED_EMOJIS = ("⚡", "🐇", "🐈", "🐢", "🐌", "🦥")
+
+    async def ps_updater() -> None:
+        # Plain message, no embed: embeds waste space and Discord bounces
+        # replaced attachments in/out of them between edits.
+        #
+        # Adaptive cadence: every render with no significant change steps the
+        # ladder down; a significant change (habituation-adjusted: scored
+        # against the session's recent churn via EMA), a 🔄 reaction, or a
+        # user message snaps back to 30s.
         nonlocal ps_msg
-        chart_every = max(1, round(30 / interval))  # re-render image every ~30s
+        legend = ""
+        last_fp = None
+        ladder = 0
+        last_render = 0.0
+        last_means: dict | None = None
+        ema = 0.0
+        shown_speed: str | None = None
         try:
-            for tick in range(max_ticks):
+            while True:
                 try:
-                    tree = (await session.process_tree())[:4000]
-                    embed = discord.Embed(color=0x5865F2, description=tree)
-                    embed.set_footer(text="🟨 CPU % · 🟦 RSS GB · x = minutes ago · "
-                                          f"updates every {interval:.0f}s · "
-                                          "cleared when Claude replies")
+                    means = window_means(list(samples)) if samples else {}
+                    score = change_score(last_means, means) if last_means is not None else 0.0
+                    significant = last_means is not None and score > max(0.5, 3 * ema)
+                    ema = 0.95 * ema + 0.05 * score
+                    forced = ps_ctl.pop("force", False)
+                    due = time.time() - last_render >= PS_LADDER[ladder]
+                    if not (significant or forced or due):
+                        await asyncio.sleep(PS_TICK)
+                        continue
+                    if significant or forced:
+                        if ladder and significant:
+                            LOG.info(f"ps monitor re-engaged (score {score:.2f}, ema {ema:.2f})")
+                        ladder = 0
+                    elif due:
+                        ladder = min(ladder + 1, len(PS_LADDER) - 1)
+                    last_render = time.time()
+                    last_means = means
+
                     new_chart = None
-                    if len(samples) >= 2 and tick % chart_every == 0:
-                        png = await asyncio.to_thread(render_chart, list(samples))
-                        new_chart = discord.File(io.BytesIO(png), "ps.png")
-                    if new_chart is not None:
-                        embed.set_image(url="attachment://ps.png")
-                        if ps_msg is None:
-                            ps_msg = await (await get_chan()).send(embed=embed, file=new_chart)
-                        else:
-                            await ps_msg.edit(embed=embed, attachments=[new_chart])
+                    window = chart_window(list(samples), PS_LADDER[ladder] + 600) if samples else []
+                    if len(window) >= 2:
+                        fp = chart_fingerprint(window)
+                        if fp != last_fp:  # skip upload when the picture wouldn't change
+                            last_fp = fp
+                            png, legend = await asyncio.to_thread(render_chart, window)
+                            new_chart = discord.File(io.BytesIO(png), "ps.png")
+                    if generating():
+                        status = f"⚡ generating · ↑{token_state['value']} tokens"
+                    elif token_state["spinner"]:
+                        waiting = fmt_duration(time.time() - token_state["changed_at"])
+                        status = f"⏳ tokens static {waiting} — waiting on tool/API"
                     else:
-                        if ps_msg is not None and ps_msg.attachments:
-                            embed.set_image(url="attachment://ps.png")  # keep old chart
-                        if ps_msg is None:
-                            ps_msg = await (await get_chan()).send(embed=embed)
-                        else:
-                            await ps_msg.edit(embed=embed)
+                        status = "💤 no turn running"
+                    if watcher and watcher.context_tokens:
+                        status += f" · {fmt_context(watcher.context_tokens)}"
+                    status += f" · {SPEED_EMOJIS[ladder]}{fmt_duration(PS_LADDER[ladder])}"
+                    active = [t for t in load_tasks(session.config, session.state["session_id"])
+                              if t.get("status") == "in_progress" and t.get("activeForm")]
+                    if active:
+                        status += "\n-# 🟨 " + " · ".join(t["activeForm"][:60] for t in active[:3])
+                    content = status + (f"\n-# {legend}" if legend else "")
+                    if ps_msg is None:
+                        ps_msg = await (await get_chan()).send(
+                            content,
+                            file=new_chart if new_chart is not None else discord.utils.MISSING)
+                        await ps_msg.add_reaction("❌")  # close
+                    elif new_chart is not None:
+                        await ps_msg.edit(content=content, attachments=[new_chart])
+                    else:
+                        await ps_msg.edit(content=content)
+                    # keep the speed reaction in sync with the cadence
+                    desired = SPEED_EMOJIS[ladder]
+                    if desired != shown_speed:
+                        try:
+                            if shown_speed:
+                                await ps_msg.remove_reaction(shown_speed, client.user)
+                            await ps_msg.add_reaction(desired)
+                            shown_speed = desired
+                        except discord.HTTPException:
+                            pass
                 except discord.HTTPException as err:
-                    LOG.warning(f"ps embed update failed: {err}")  # retry next tick
-                await asyncio.sleep(interval)
-            # lifetime expired naturally: don't leave a stale embed behind
-            if ps_msg is not None:
-                try:
-                    await ps_msg.delete()
-                except discord.HTTPException:
-                    pass
-                ps_msg = None
+                    LOG.warning(f"ps monitor update failed: {err}")  # retry next tick
+                await asyncio.sleep(PS_TICK)
         except asyncio.CancelledError:
             pass
 
@@ -926,8 +1267,14 @@ def run_bridge(tmux_session: str) -> None:
             ps_msg = None
 
     async def relay(text: str) -> None:
+        # claude's canned no-op when an automated event (e.g. a background
+        # task completion notification) needs no reply — noise in Discord
+        if text.strip().rstrip(".") == "No response requested":
+            LOG.info("relay: suppressed no-op reply")
+            return
         touch()
         await clear_ps()  # a real reply supersedes the live process view
+        text = convert_tables(text)
         chunks = chunk_message(text)
         if len(chunks) > 5:  # multi-page reply: attach as a file, don't spam
             preview = chunk_message(text, 1800)[0]
@@ -948,8 +1295,10 @@ def run_bridge(tmux_session: str) -> None:
         return "\n".join(["⚙️ **working**"] + [f"-# 🔧 {d}" for d in tool_log])
 
     async def on_tool(desc: str) -> None:
+        # NB: deliberately does NOT touch() the idle timer — background-task
+        # polling produces steady tool events, and the monitor should open on
+        # "no messages for a while" even when tools are ticking
         nonlocal status_msg, last_status_edit
-        touch()
         tool_log.append(desc)
         try:
             if status_msg is None:
@@ -973,11 +1322,16 @@ def run_bridge(tmux_session: str) -> None:
         tool_log.clear()
 
     async def on_turn_end(stats: dict) -> None:
+        ctx_tokens = (watcher.context_tokens or 0) if watcher else 0
         LOG.info(f"turn end: {fmt_duration(stats['seconds'])}, "
-                 f"{stats['tools']} tools, {stats['output_tokens']:,} output tokens")
-        await finalize_status(f"-# ✅ {fmt_duration(stats['seconds'])} · "
+                 f"{stats['tools']} tools, {stats['output_tokens']:,} output tokens"
+                 + (f", {fmt_context(ctx_tokens)}" if ctx_tokens else ""))
+        # context note only when it's getting tight
+        warn = (f" · ⚠️ ctx {ctx_tokens / CONTEXT_LIMIT:.0%}"
+                if ctx_tokens > CONTEXT_LIMIT * 0.8 else "")
+        await finalize_status(f"-# {fmt_duration(stats['seconds'])} · "
                               f"{stats['tools']} tool calls · "
-                              f"{stats['output_tokens']:,} output tokens")
+                              f"{stats['output_tokens']:,} output tokens{warn}")
         await clear_working()
 
     async def clear_working() -> None:
@@ -1016,23 +1370,54 @@ def run_bridge(tmux_session: str) -> None:
             asyncio.create_task(watcher.run())
             asyncio.create_task(idle_watchdog(watcher))
             asyncio.create_task(sampler())
+            asyncio.create_task(tui_poller())
 
-    IDLE_AFTER = 120  # auto-open the process monitor after 2 quiet minutes
+    IDLE_AFTER = 60  # auto-open the process monitor after 1 quiet minute
 
     async def idle_watchdog(watcher: TranscriptWatcher) -> None:
         nonlocal ps_task
         while True:
             await asyncio.sleep(15)
             try:
+                # "working" = any of: main turn active, a subagent streaming
+                # recently, or monitored processes burning CPU (covers
+                # backgrounded tasks grinding between turns)
                 mid_turn = watcher.turn_started is not None
+                subagents = time.time() - watcher.sidechain_seen < 180
+                busy_procs = bool(samples) and any(
+                    v[0] >= 10 for k, v in samples[-1][1].items()
+                    if not k.startswith("claude"))
+                working = mid_turn or subagents or busy_procs
                 quiet = time.time() - last_activity > IDLE_AFTER
                 ps_idle = ps_msg is None and (ps_task is None or ps_task.done())
-                if mid_turn and quiet and ps_idle:
-                    LOG.info(f"no visible activity for {IDLE_AFTER}s mid-turn — "
-                             "auto-opening process monitor (30s refresh)")
-                    ps_task = asyncio.create_task(ps_updater(interval=30, max_ticks=240))
+                # a long generation isn't a stall — tokens are visibly flowing
+                if working and quiet and ps_idle and not generating():
+                    reason = ("turn" if mid_turn else
+                              "subagent" if subagents else "processes")
+                    LOG.info(f"no messages for {IDLE_AFTER}s while working "
+                             f"({reason}) — auto-opening process monitor")
+                    ps_task = asyncio.create_task(ps_updater())
             except Exception:
                 LOG.exception("idle watchdog error")
+
+    @client.event
+    async def on_raw_reaction_add(payload) -> None:
+        if (ps_msg is None or payload.message_id != ps_msg.id
+                or payload.user_id != user_id):
+            return
+        if str(payload.emoji) == "❌":
+            LOG.info("ps monitor closed via ❌ reaction")
+            touch()  # give the watchdog a fresh idle window before reopening
+            await clear_ps()
+        elif str(payload.emoji) in SPEED_EMOJIS:
+            LOG.info("ps monitor cadence reset via speed reaction")
+            ps_ctl["force"] = True
+            try:  # remove the user's tap so the indicator stays clean
+                channel = await get_chan()
+                msg = await channel.fetch_message(payload.message_id)
+                await msg.remove_reaction(payload.emoji, discord.Object(id=user_id))
+            except discord.HTTPException:
+                pass
 
     @client.event
     async def on_message(message: discord.Message) -> None:
@@ -1043,6 +1428,40 @@ def run_bridge(tmux_session: str) -> None:
             return
         content = message.content.strip()
         if not content and not message.attachments:
+            return
+        if content.startswith("!/") and len(content) > 2:
+            slash = content[1:]
+            LOG.info(f"slash command: {slash.split()[0]}")
+            await session.send(slash)
+            await message.add_reaction("✅")
+            return
+        if content == "!help":
+            enqueue(
+                "**claudebot commands**\n"
+                "`!peek` — show the live claude TUI pane\n"
+                "`!ps` — live activity monitor: status line + per-process CPU/RSS "
+                "chart. Updates fast (30s) while metrics move, decaying to every "
+                "30min when things are steady (⚡🐇🐈🐢🐌🦥 reaction = current speed; "
+                "tap it to snap back to ⚡). Significant changes or any message from "
+                "you also re-engage. React ❌ to close. Auto-opens after 1 "
+                "message-quiet minute mid-turn\n"
+                "`!tasks` — Claude's task list for this session (🟩 done · 🟨 active · "
+                "⬜ pending)\n"
+                "`!esc` — interrupt the current turn (escapes until the prompt returns)\n"
+                "`!bg` — move the running Bash tool to the background (ctrl+b) so the "
+                "turn continues and queued messages get read\n"
+                "`!new` — start a fresh claude session in the same directory\n"
+                "`!status` — session card: workspace, session id, container, transcript\n"
+                "`!/<command>` — send any claude slash command (Discord hijacks bare "
+                "`/`): `!/compact`, `!/clear`, `!/goal do thing`… TUI-only output "
+                "(e.g. `!/cost`) is visible via `!peek`\n"
+                "`!help` — this message\n\n"
+                "Anything else is forwarded to Claude — 👀 while it works, 📨 if queued "
+                "into a turn that's already running (read between tool calls, full "
+                "context). Attachments are saved and their paths passed along. Replies "
+                "longer than ~5 messages arrive as a `reply.md` attachment.\n"
+                "-# from the terminal: `claudebot` (re)attaches · `claudebot --continue` "
+                "resumes · `claudebot --stop` tears down")
             return
         if content == "!new":
             LOG.info("command: !new")
@@ -1064,6 +1483,9 @@ def run_bridge(tmux_session: str) -> None:
             LOG.info("command: !bg")
             await session.background_tool()
             await message.add_reaction("⏬")
+            return
+        if content == "!tasks":
+            enqueue(render_tasks(load_tasks(session.config, session.state["session_id"])))
             return
         if content == "!peek":
             pane = (await session.capture()).replace("```", "`​``")
@@ -1090,6 +1512,23 @@ def run_bridge(tmux_session: str) -> None:
                                 value=f"{stat.st_size // 1024} KB · active "
                                       f"{fmt_duration(time.time() - stat.st_mtime)} ago",
                                 inline=True)
+            tasks = load_tasks(session.config, session.state["session_id"])
+            if tasks:
+                counts = {}
+                for t in tasks:
+                    counts[t.get("status", "?")] = counts.get(t.get("status", "?"), 0) + 1
+                embed.add_field(name="Tasks",
+                                value=" · ".join(f"{TASK_ICONS.get(s, '❔')} {n}"
+                                                 for s, n in sorted(counts.items())),
+                                inline=True)
+            ctx = ((watcher and watcher.context_tokens)
+                   or latest_context_tokens(transcript))
+            if ctx:
+                bar_fill = round(ctx / CONTEXT_LIMIT * 10)
+                embed.add_field(name="Context",
+                                value=f"{'▰' * bar_fill}{'▱' * (10 - bar_fill)} "
+                                      f"{fmt_context(ctx)}",
+                                inline=False)
             enqueue(embed=embed)
             return
 
@@ -1118,6 +1557,8 @@ def run_bridge(tmux_session: str) -> None:
         mid_turn = watcher is not None and watcher.turn_started is not None
         await session.send("\n\n".join(parts))
         begin_turn()
+        if ps_task is not None and not ps_task.done():
+            ps_ctl["force"] = True  # you're back: fresh chart, fast cadence
         try:
             emoji = "📨" if mid_turn else WORKING  # queued into a running turn?
             await message.add_reaction(emoji)
