@@ -343,7 +343,11 @@ def launch(cfg: dict, claude_args: list[str]) -> None:
     if container_enabled(cfg):  # clear any leftover container from a dead session
         subprocess.run(["docker", "rm", "-f", container_name(name)], capture_output=True)
 
-    tmux_sync("new-session", "-d", "-s", name, "-n", "claude", "-c", cwd)
+    tmux_sync("new-session", "-d", "-s", name, "-n", "claude", "-c", cwd,
+              "-x", "220", "-y", "200")
+    # keep the pane tall while detached so big interactive prompts (e.g. the
+    # AskUserQuestion selector) fit and !peek can capture them whole
+    tmux_sync("set-option", "-t", session_t(name), "window-size", "manual")
     tmux_sync("send-keys", "-t", claude_win(name), claude_command(state), "Enter")
 
     bridge_cmd = (f"exec {shlex.quote(str(SCRIPT_DIR / '.venv/bin/python'))} "
@@ -846,11 +850,12 @@ class TranscriptWatcher:
     {"seconds", "tools", "output_tokens"}."""
 
     def __init__(self, session: ClaudeSession, on_text,
-                 on_turn_end=None, on_tool=None) -> None:
+                 on_turn_end=None, on_tool=None, on_question=None) -> None:
         self.session = session
         self.on_text = on_text
         self.on_turn_end = on_turn_end
         self.on_tool = on_tool
+        self.on_question = on_question  # called with an interactive-prompt tool_use block
         self.path: Path | None = None
         self.offset = 0
         self.seen_uuids: set[str] = set()
@@ -930,6 +935,10 @@ class TranscriptWatcher:
         if self.on_tool:
             for block in tools:
                 await self.on_tool(tool_desc(block))
+        if self.on_question:  # interactive prompts that block the TUI
+            for block in tools:
+                if block.get("name") in ("AskUserQuestion", "ExitPlanMode"):
+                    await self.on_question(block)
         texts = [b.get("text", "") for b in content
                  if isinstance(b, dict) and b.get("type") == "text"]
         text = "\n\n".join(t for t in texts if t.strip())
@@ -1112,11 +1121,17 @@ def run_bridge(tmux_session: str) -> None:
                           f"{str(item['content'])[:120]!r}")
             await asyncio.sleep(0.3)  # gentle pacing under discord.py's own limiter
 
-    # --- live !ps monitor: auto-updates until Claude actually replies ------
-    ps_msg: discord.Message | None = None
-    ps_task: asyncio.Task | None = None
-    ps_ctl: dict = {}  # {"force": True} -> immediate render + ladder reset
+    # --- live !ps monitor (state owned by the reconciler below) ------------
+    mon: dict = {"msg": None, "force": False, "ladder": 0, "last_render": 0.0,
+                 "rung_since": 0.0, "last_means": None, "ema": 0.0, "legend": "",
+                 "fp": None, "speed": None}
+    mon_wake = asyncio.Event()
     last_activity = time.time()
+
+    def wake_monitor(force: bool = False) -> None:
+        if force:
+            mon["force"] = True
+        mon_wake.set()
 
     def touch() -> None:
         nonlocal last_activity
@@ -1164,107 +1179,233 @@ def run_bridge(tmux_session: str) -> None:
                 pass  # container down between sessions etc.
             await asyncio.sleep(10)
 
-    PS_TICK = 30  # evaluate every 30s; edits follow the decay ladder
-    PS_LADDER = (30, 60, 300, 600, 1200, 1800)  # 30s -> 1m -> 5m -> ... -> 30m
+    PS_TICK = 15  # reconciler tick; renders follow the decay ladder
+    PS_LADDER = (30, 60, 300, 600, 1200, 1800)  # render cadence per rung
+    # how long to dwell at each rung before decaying to the next — so the
+    # fast cadences persist (e.g. 1-min refresh for 10 min) instead of
+    # stepping down after a single render
+    PS_DWELL = (120, 600, 1800, 1800, 1800, 1800)  # 30s×2m, 1m×10m, 5m×30m, …
     # the reaction shows the current cadence; tapping it snaps back to ⚡
     SPEED_EMOJIS = ("⚡", "🐇", "🐈", "🐢", "🐌", "🦥")
 
-    async def ps_updater() -> None:
-        # Plain message, no embed: embeds waste space and Discord bounces
-        # replaced attachments in/out of them between edits.
-        #
-        # Adaptive cadence: every render with no significant change steps the
-        # ladder down; a significant change (habituation-adjusted: scored
-        # against the session's recent churn via EMA), a 🔄 reaction, or a
-        # user message snaps back to 30s.
-        nonlocal ps_msg
-        legend = ""
-        last_fp = None
-        ladder = 0
-        last_render = 0.0
-        last_means: dict | None = None
-        ema = 0.0
-        shown_speed: str | None = None
-        try:
-            while True:
-                try:
-                    means = window_means(list(samples)) if samples else {}
-                    score = change_score(last_means, means) if last_means is not None else 0.0
-                    significant = last_means is not None and score > max(0.5, 3 * ema)
-                    ema = 0.95 * ema + 0.05 * score
-                    forced = ps_ctl.pop("force", False)
-                    due = time.time() - last_render >= PS_LADDER[ladder]
-                    if not (significant or forced or due):
-                        await asyncio.sleep(PS_TICK)
-                        continue
-                    if significant or forced:
-                        if ladder and significant:
-                            LOG.info(f"ps monitor re-engaged (score {score:.2f}, ema {ema:.2f})")
-                        ladder = 0
-                    elif due:
-                        ladder = min(ladder + 1, len(PS_LADDER) - 1)
-                    last_render = time.time()
-                    last_means = means
+    IDLE_AFTER = 60  # auto-open after 1 message-quiet minute while working
 
-                    new_chart = None
-                    window = chart_window(list(samples), PS_LADDER[ladder] + 600) if samples else []
-                    if len(window) >= 2:
-                        fp = chart_fingerprint(window)
-                        if fp != last_fp:  # skip upload when the picture wouldn't change
-                            last_fp = fp
-                            png, legend = await asyncio.to_thread(render_chart, window)
-                            new_chart = discord.File(io.BytesIO(png), "ps.png")
-                    if generating():
-                        status = f"⚡ generating · ↑{token_state['value']} tokens"
-                    elif token_state["spinner"]:
-                        waiting = fmt_duration(time.time() - token_state["changed_at"])
-                        status = f"⏳ tokens static {waiting} — waiting on tool/API"
-                    else:
-                        status = "💤 no turn running"
-                    if watcher and watcher.context_tokens:
-                        status += f" · {fmt_context(watcher.context_tokens)}"
-                    status += f" · {SPEED_EMOJIS[ladder]}{fmt_duration(PS_LADDER[ladder])}"
-                    active = [t for t in load_tasks(session.config, session.state["session_id"])
-                              if t.get("status") == "in_progress" and t.get("activeForm")]
-                    if active:
-                        status += "\n-# 🟨 " + " · ".join(t["activeForm"][:60] for t in active[:3])
-                    content = status + (f"\n-# {legend}" if legend else "")
-                    if ps_msg is None:
-                        ps_msg = await (await get_chan()).send(
-                            content,
-                            file=new_chart if new_chart is not None else discord.utils.MISSING)
-                        await ps_msg.add_reaction("❌")  # close
-                    elif new_chart is not None:
-                        await ps_msg.edit(content=content, attachments=[new_chart])
-                    else:
-                        await ps_msg.edit(content=content)
-                    # keep the speed reaction in sync with the cadence
-                    desired = SPEED_EMOJIS[ladder]
-                    if desired != shown_speed:
-                        try:
-                            if shown_speed:
-                                await ps_msg.remove_reaction(shown_speed, client.user)
-                            await ps_msg.add_reaction(desired)
-                            shown_speed = desired
-                        except discord.HTTPException:
-                            pass
-                except discord.HTTPException as err:
-                    LOG.warning(f"ps monitor update failed: {err}")  # retry next tick
-                await asyncio.sleep(PS_TICK)
-        except asyncio.CancelledError:
-            pass
-
-    async def clear_ps() -> None:
-        nonlocal ps_msg, ps_task
-        if ps_task is not None:
-            ps_task.cancel()
-            ps_task = None
-        if ps_msg is not None:
+    async def close_monitor(reason: str) -> None:
+        if mon["msg"] is not None:
             try:
-                await ps_msg.delete()
+                await mon["msg"].delete()
             except discord.HTTPException:
                 pass
-            ps_msg = None
+            mon["msg"] = None
+            LOG.info(f"ps monitor closed ({reason})")
+        mon.update(ladder=0, last_render=0.0, legend="", fp=None,
+                   speed=None, force=False)
+
+    async def render_monitor() -> None:
+        """Create or refresh the monitor message (status line + chart)."""
+        new_chart = None
+        window = chart_window(list(samples), PS_LADDER[mon["ladder"]] + 600) if samples else []
+        if len(window) >= 2:
+            fp = chart_fingerprint(window)
+            if fp != mon["fp"]:  # skip upload when the picture wouldn't change
+                mon["fp"] = fp
+                png, mon["legend"] = await asyncio.to_thread(render_chart, window)
+                new_chart = discord.File(io.BytesIO(png), "ps.png")
+        if generating():
+            status = f"⚡ generating · ↑{token_state['value']} tokens"
+        elif token_state["spinner"]:
+            waiting = fmt_duration(time.time() - token_state["changed_at"])
+            status = f"⏳ tokens static {waiting} — waiting on tool/API"
+        else:
+            status = "💤 no turn running"
+        if watcher and watcher.context_tokens:
+            status += f" · {fmt_context(watcher.context_tokens)}"
+        status += f" · {SPEED_EMOJIS[mon['ladder']]}{fmt_duration(PS_LADDER[mon['ladder']])}"
+        active = [t for t in load_tasks(session.config, session.state["session_id"])
+                  if t.get("status") == "in_progress" and t.get("activeForm")]
+        if active:
+            status += "\n-# 🟨 " + " · ".join(t["activeForm"][:60] for t in active[:3])
+        content = status + (f"\n-# {mon['legend']}" if mon["legend"] else "")
+        try:
+            if mon["msg"] is None:
+                mon["msg"] = await (await get_chan()).send(
+                    content,
+                    file=new_chart if new_chart is not None else discord.utils.MISSING)
+                await mon["msg"].add_reaction("❌")
+            elif new_chart is not None:
+                await mon["msg"].edit(content=content, attachments=[new_chart])
+            else:
+                await mon["msg"].edit(content=content)
+            # keep the speed reaction in sync with the cadence
+            desired = SPEED_EMOJIS[mon["ladder"]]
+            if mon["msg"] is not None and desired != mon["speed"]:
+                if mon["speed"]:
+                    await mon["msg"].remove_reaction(mon["speed"], client.user)
+                await mon["msg"].add_reaction(desired)
+                mon["speed"] = desired
+        except discord.NotFound:
+            mon["msg"] = None  # deleted out from under us; rules will recreate
+        except discord.HTTPException as err:
+            LOG.warning(f"ps monitor update failed: {err}")  # next tick retries
+        mon["last_render"] = time.time()
+
+    async def ps_reconciler() -> None:
+        """Single owner of the monitor lifecycle. Each tick: derive desired
+        state from the rules, compare with actual state, and converge —
+        creation, deletion, cadence, and updates all live here, so a wedged
+        monitor self-heals within one tick. Other actors only adjust inputs
+        (force flag, last_activity) or delete the message; never both."""
+        while True:
+            mon_wake.clear()
+            try:
+                await asyncio.wait_for(mon_wake.wait(), timeout=PS_TICK)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                now = time.time()
+                means = window_means(list(samples)) if samples else {}
+                forced = mon["force"]
+                mon["force"] = False
+
+                if mon["msg"] is None:
+                    mon["last_means"] = means  # keep the baseline current
+                    mid_turn = watcher is not None and watcher.turn_started is not None
+                    subagents = watcher is not None and now - watcher.sidechain_seen < 180
+                    busy_procs = bool(samples) and any(
+                        v[0] >= 10 for k, v in samples[-1][1].items()
+                        if not k.startswith("claude"))
+                    working = mid_turn or subagents or busy_procs
+                    quiet = now - last_activity > IDLE_AFTER
+                    if forced or (working and quiet and not generating()):
+                        reason = ("requested" if forced else
+                                  "turn" if mid_turn else
+                                  "subagent" if subagents else "processes")
+                        LOG.info(f"ps monitor opening ({reason})")
+                        mon["ladder"] = 0
+                        mon["rung_since"] = now
+                        await render_monitor()
+                else:
+                    # a process spawning or exiting (by name) is always a
+                    # significant change — reset to fast cadence
+                    def name_set(m):
+                        return {k.rsplit("·", 1)[0] for k in m}
+                    struct = (mon["last_means"] is not None
+                              and name_set(mon["last_means"]) != name_set(means))
+                    score = (change_score(mon["last_means"], means)
+                             if mon["last_means"] is not None else 0.0)
+                    significant = struct or score > max(0.5, 3 * mon["ema"])
+                    mon["ema"] = 0.97 * mon["ema"] + 0.03 * score
+                    due = now - mon["last_render"] >= PS_LADDER[mon["ladder"]]
+                    if significant or forced:
+                        if mon["ladder"]:
+                            why = ("process set changed" if struct else
+                                   "requested" if forced else f"score {score:.2f}")
+                            LOG.info(f"ps monitor re-engaged ({why})")
+                        mon["ladder"] = 0
+                        mon["rung_since"] = now
+                        mon["last_means"] = means
+                        await render_monitor()
+                    elif due:
+                        mon["last_means"] = means
+                        await render_monitor()
+                        # decay only after dwelling at this rung long enough
+                        if now - mon["rung_since"] >= PS_DWELL[mon["ladder"]]:
+                            mon["ladder"] = min(mon["ladder"] + 1, len(PS_LADDER) - 1)
+                            mon["rung_since"] = now
+            except Exception:
+                LOG.exception("ps reconciler error")
+
+    # --- interactive prompt handling (AskUserQuestion / ExitPlanMode) ------
+    # These block the TUI waiting for arrow-key selection, which can't be
+    # answered by pasting text — they hose the session. We read the full
+    # prompt from the transcript (complete regardless of pane size), relay it
+    # with buttons, and answer by dismissing the blocking UI (Esc) then
+    # steering with the chosen text. Esc-and-steer is uniform and robust: it
+    # works for single/multi-select, freeform, and plan prompts alike.
+    pending_q: dict = {"active": False, "msg": None, "options": []}
+
+    async def dismiss_prompt() -> None:
+        await session.interrupt()  # one Esc dismisses the selector / backs out
+
+    async def answer_prompt(text: str) -> None:
+        await dismiss_prompt()
+        await asyncio.sleep(0.3)
+        await session.send(text)
+
+    async def clear_pending(disable_view: bool = True) -> None:
+        if pending_q["msg"] is not None and disable_view:
+            try:
+                await pending_q["msg"].edit(view=None)
+            except discord.HTTPException:
+                pass
+        pending_q.update(active=False, msg=None, options=[])
+
+    def build_question_view(options: list[str]):
+        view = discord.ui.View(timeout=None)
+
+        def make_cb(label: str):
+            async def cb(interaction: discord.Interaction):
+                if interaction.user.id != user_id:
+                    return
+                await interaction.response.defer()
+                LOG.info(f"interactive prompt answered: {label[:40]}")
+                await clear_pending()
+                await answer_prompt(f"My answer: {label}")
+                await interaction.followup.send(f"➡️ answered: {label[:80]}")
+            return cb
+
+        for i, label in enumerate(options[:20]):
+            btn = discord.ui.Button(label=f"{i+1}. {label[:72]}",
+                                    style=discord.ButtonStyle.primary)
+            btn.callback = make_cb(label)
+            view.add_item(btn)
+
+        async def dismiss_cb(interaction: discord.Interaction):
+            if interaction.user.id != user_id:
+                return
+            await interaction.response.defer()
+            LOG.info("interactive prompt dismissed (Esc)")
+            await clear_pending()
+            await dismiss_prompt()
+            await interaction.followup.send("✕ dismissed")
+        dbtn = discord.ui.Button(label="✕ dismiss (Esc)", style=discord.ButtonStyle.danger)
+        dbtn.callback = dismiss_cb
+        view.add_item(dbtn)
+        return view
+
+    async def on_question(block: dict) -> None:
+        name = block.get("name")
+        inp = block.get("input") or {}
+        try:
+            if name == "AskUserQuestion":
+                qs = inp.get("questions") or []
+                options, lines = [], []
+                for q in qs:
+                    lines.append(f"**{q.get('header','Question')}** — {q.get('question','')}")
+                    for o in q.get("options", []):
+                        lines.append(f"  • {o.get('label','')} — {o.get('description','')[:120]}")
+                        options.append(o.get("label", ""))
+                single = len(qs) == 1 and not qs[0].get("multiSelect")
+                view = build_question_view(options) if single else None
+                if not single:
+                    lines.append("\n-# reply with your answer (text) to send it")
+                header = "❓ **Claude is asking** (interactive prompt — buttons, `!N`, or reply):"
+                body = header + "\n" + "\n".join(lines)
+            else:  # ExitPlanMode
+                plan = inp.get("plan", "")
+                options = ["approve the plan and start implementing"]
+                body = ("📋 **Claude finished planning** — approve to proceed, or reply "
+                        "with changes:\n\n" + plan)
+                view = build_question_view(options)
+            channel = await get_chan()
+            chunks = chunk_message(body)
+            for chunk in chunks[:-1]:
+                await channel.send(chunk)
+            msg = await channel.send(chunks[-1], view=view)
+            pending_q.update(active=True, msg=msg if view else None, options=options)
+            LOG.info(f"relayed interactive prompt: {name} ({len(options)} options)")
+        except discord.HTTPException as err:
+            LOG.warning(f"failed to relay interactive prompt: {err}")
 
     async def relay(text: str) -> None:
         # claude's canned no-op when an automated event (e.g. a background
@@ -1273,7 +1414,8 @@ def run_bridge(tmux_session: str) -> None:
             LOG.info("relay: suppressed no-op reply")
             return
         touch()
-        await clear_ps()  # a real reply supersedes the live process view
+        await clear_pending()  # any prose reply means the prompt resolved
+        await close_monitor("reply")  # a real reply supersedes the monitor
         text = convert_tables(text)
         chunks = chunk_message(text)
         if len(chunks) > 5:  # multi-page reply: attach as a file, don't spam
@@ -1365,53 +1507,25 @@ def run_bridge(tmux_session: str) -> None:
         if not watcher_started:
             watcher_started = True
             watcher = TranscriptWatcher(
-                session, relay, on_turn_end=on_turn_end, on_tool=on_tool)
+                session, relay, on_turn_end=on_turn_end, on_tool=on_tool,
+                on_question=on_question)
             asyncio.create_task(sender_loop())
             asyncio.create_task(watcher.run())
-            asyncio.create_task(idle_watchdog(watcher))
+            asyncio.create_task(ps_reconciler())
             asyncio.create_task(sampler())
             asyncio.create_task(tui_poller())
 
-    IDLE_AFTER = 60  # auto-open the process monitor after 1 quiet minute
-
-    async def idle_watchdog(watcher: TranscriptWatcher) -> None:
-        nonlocal ps_task
-        while True:
-            await asyncio.sleep(15)
-            try:
-                # "working" = any of: main turn active, a subagent streaming
-                # recently, or monitored processes burning CPU (covers
-                # backgrounded tasks grinding between turns)
-                mid_turn = watcher.turn_started is not None
-                subagents = time.time() - watcher.sidechain_seen < 180
-                busy_procs = bool(samples) and any(
-                    v[0] >= 10 for k, v in samples[-1][1].items()
-                    if not k.startswith("claude"))
-                working = mid_turn or subagents or busy_procs
-                quiet = time.time() - last_activity > IDLE_AFTER
-                ps_idle = ps_msg is None and (ps_task is None or ps_task.done())
-                # a long generation isn't a stall — tokens are visibly flowing
-                if working and quiet and ps_idle and not generating():
-                    reason = ("turn" if mid_turn else
-                              "subagent" if subagents else "processes")
-                    LOG.info(f"no messages for {IDLE_AFTER}s while working "
-                             f"({reason}) — auto-opening process monitor")
-                    ps_task = asyncio.create_task(ps_updater())
-            except Exception:
-                LOG.exception("idle watchdog error")
-
     @client.event
     async def on_raw_reaction_add(payload) -> None:
-        if (ps_msg is None or payload.message_id != ps_msg.id
+        if (mon["msg"] is None or payload.message_id != mon["msg"].id
                 or payload.user_id != user_id):
             return
         if str(payload.emoji) == "❌":
-            LOG.info("ps monitor closed via ❌ reaction")
-            touch()  # give the watchdog a fresh idle window before reopening
-            await clear_ps()
+            touch()  # fresh quiet window before the reconciler may reopen
+            await close_monitor("❌ reaction")
         elif str(payload.emoji) in SPEED_EMOJIS:
             LOG.info("ps monitor cadence reset via speed reaction")
-            ps_ctl["force"] = True
+            wake_monitor(force=True)
             try:  # remove the user's tap so the indicator stays clean
                 channel = await get_chan()
                 msg = await channel.fetch_message(payload.message_id)
@@ -1421,7 +1535,6 @@ def run_bridge(tmux_session: str) -> None:
 
     @client.event
     async def on_message(message: discord.Message) -> None:
-        nonlocal ps_task
         if message.author.bot:
             return
         if message.channel.id != channel_id or message.author.id != user_id:
@@ -1450,6 +1563,8 @@ def run_bridge(tmux_session: str) -> None:
                 "`!esc` — interrupt the current turn (escapes until the prompt returns)\n"
                 "`!bg` — move the running Bash tool to the background (ctrl+b) so the "
                 "turn continues and queued messages get read\n"
+                "`!clear` — dismiss a stuck interactive prompt (Esc) and un-hose the session\n"
+                "`!url` — re-print the md viewer's cloudflared tunnel link\n"
                 "`!new` — start a fresh claude session in the same directory\n"
                 "`!status` — session card: workspace, session id, container, transcript\n"
                 "`!/<command>` — send any claude slash command (Discord hijacks bare "
@@ -1468,7 +1583,7 @@ def run_bridge(tmux_session: str) -> None:
             await session.start_fresh()
             await finalize_status("-# 🆕 session restarted")
             await clear_working()
-            await clear_ps()
+            await close_monitor("session restart")
             enqueue("🆕 Started a fresh Claude session.")
             return
         if content == "!esc":
@@ -1476,7 +1591,7 @@ def run_bridge(tmux_session: str) -> None:
             await session.interrupt()
             await finalize_status("-# 🛑 interrupted")
             await clear_working()  # interrupted turns never write end_turn
-            await clear_ps()
+            await close_monitor("interrupt")
             await message.add_reaction("🛑")
             return
         if content == "!bg":
@@ -1484,6 +1599,31 @@ def run_bridge(tmux_session: str) -> None:
             await session.background_tool()
             await message.add_reaction("⏬")
             return
+        if content == "!url":  # re-print the md viewer's cloudflared tunnel
+            if not container_enabled(session.config):
+                enqueue("not running in a container — no tunnel")
+                return
+            log_txt = await run_out("docker", "exec", container_name(session.name),
+                                    "cat", "/tmp/cloudflared.log")
+            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", log_txt)
+            enqueue(f"🌐 md viewer: {m.group(0)}" if m
+                    else "tunnel not up yet (still starting, or it failed)")
+            return
+        if content == "!clear":  # un-hose a stuck interactive prompt
+            LOG.info("command: !clear")
+            await clear_pending()
+            await dismiss_prompt()
+            await message.add_reaction("🧹")
+            return
+        if pending_q["active"] and re.fullmatch(r"!\d+", content):
+            idx = int(content[1:]) - 1  # !N picks the Nth relayed option
+            opts = pending_q.get("options") or []
+            if 0 <= idx < len(opts):
+                LOG.info(f"interactive prompt answered by number: {idx+1}")
+                await clear_pending()
+                await answer_prompt(f"My answer: {opts[idx]}")
+                await message.add_reaction("✅")
+                return
         if content == "!tasks":
             enqueue(render_tasks(load_tasks(session.config, session.state["session_id"])))
             return
@@ -1492,8 +1632,7 @@ def run_bridge(tmux_session: str) -> None:
             enqueue(f"```\n{pane[-1900:] or '(empty pane)'}\n```")
             return
         if content == "!ps":
-            await clear_ps()  # restart fresh if one is already live
-            ps_task = asyncio.create_task(ps_updater())
+            wake_monitor(force=True)  # reconciler opens/refreshes within a tick
             return
         if content == "!status":
             embed = discord.Embed(title="claudebot", color=0xCC785C)
@@ -1555,10 +1694,14 @@ def run_bridge(tmux_session: str) -> None:
         LOG.info(f"forward -> claude: {len(content)} chars"
                  + (f", {len(message.attachments)} attachment(s)" if message.attachments else ""))
         mid_turn = watcher is not None and watcher.turn_started is not None
+        if pending_q["active"]:  # a blocking prompt is up — clear it before pasting
+            await clear_pending()
+            await dismiss_prompt()
+            await asyncio.sleep(0.3)
         await session.send("\n\n".join(parts))
         begin_turn()
-        if ps_task is not None and not ps_task.done():
-            ps_ctl["force"] = True  # you're back: fresh chart, fast cadence
+        if mon["msg"] is not None:
+            wake_monitor(force=True)  # you're back: fresh chart, fast cadence
         try:
             emoji = "📨" if mid_turn else WORKING  # queued into a running turn?
             await message.add_reaction(emoji)
