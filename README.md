@@ -181,7 +181,7 @@ pinned Z3 on top of this pattern)
 | `!bg` | Ctrl+B: move the currently running Bash tool to the background so the turn (and your queued messages) proceed immediately |
 | `!clear` | Dismiss a stuck interactive prompt (sends Esc) — un-hoses a session blocked on a TUI selector |
 | `!peek` | Show the live claude TUI pane in a code block |
-| `!ps` | Live activity monitor: a status line (⚡ generating / ⏳ waiting / 💤 idle · context usage · next-update countdown) plus a per-process CPU/RSS chart (~3KB image). Adaptive cadence: 30s → 1m → 5m → 10m → 20m → 30m as metrics stay steady (habituation: significance is judged against the session's recent churn); significant changes, a 🔄 reaction, or any message from you snap it back to 30s. The chart window is the update interval + 10 min, so slow updates show everything since the last one. React ❌ to close; cleared when Claude replies. Auto-opens after 1 message-quiet minute mid-turn (unless tokens are streaming). Sampling runs every 10s continuously |
+| `!ps` | Live activity monitor: a status line (⚡ generating / ⏳ waiting / 💤 idle · context usage · next-update countdown) plus a per-process CPU/RSS chart (~3KB image). Adaptive cadence: 30s → 1m → 5m → 10m → 20m → 30m as metrics stay steady (habituation: significance is judged against the session's recent churn); significant changes, a 🔄 reaction, or any message from you snap it back to 30s. The chart window is the update interval + 10 min, so slow updates show everything since the last one. React ❌ to close; cleared when Claude replies. Auto-opens whenever Claude's last message is 15s old and it isn't still generating — i.e. when it goes quiet (usually because it's running something). Sampling runs every 10s continuously |
 | `!status` | Embed card: workspace, session, container, transcript activity |
 | anything else | Forwarded to Claude — including **mid-turn**: messages sent while Claude works are queued (📨 reaction) and read between tool calls, with full context |
 
@@ -200,13 +200,14 @@ text attached as `reply.md` instead of a wall of chunks.
 
 ### Interactive prompts
 
-Claude Code's `AskUserQuestion` and plan-mode prompts render arrow-key
-selectors in the TUI that can't be answered by pasting text — left alone they
-block the session. The bridge handles them: it reads the full prompt from the
-**transcript** (complete even when the pane is too short to show it) and posts
-it to Discord with a button per option plus a dismiss button. Answer by
-clicking a button, replying `!N` for option N, or typing a freeform answer —
-all of which dismiss the blocking UI (Esc) and steer Claude with your choice.
-`!clear` force-dismisses one even if detection missed it. The claude pane is
-launched tall (200 lines) so big prompts also fit for `!peek`. To avoid them
-entirely, tell Claude in `CLAUDE.md` to ask in plain prose instead.
+Claude Code's `AskUserQuestion` selector renders an arrow-key menu in the TUI
+that can't be answered by pasting text — left alone it blocks the session. The
+bridge detects it by **scraping the live pane** (the transcript's `tool_use`
+line only lands *after* the choice is made, too late to relay), parses the
+question and options, and posts them to Discord with a button per option plus
+a dismiss button. Clicking a button (or replying `!N`) navigates the real
+selector — arrow keys to the chosen row, then Enter — so Claude's tool returns
+your actual choice. Typing a freeform answer instead sends Esc to dismiss and
+steers Claude with your text. `!clear` force-dismisses a stuck prompt. The
+claude pane is launched tall (200 lines) so big prompts fit for `!peek`. To
+avoid them entirely, tell Claude in `CLAUDE.md` to ask in plain prose.

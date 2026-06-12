@@ -449,7 +449,6 @@ def ps_by_name(ps_output: str, session_id: str, all_claudes: bool = False) -> di
     covered. The bridged claude is labeled "claude"; other instances
     "claude:2", "claude:3", ..."""
     procs, children, claude_pid = parse_ps(ps_output, session_id)
-    parent_of = {kid: p for p, kids in children.items() for kid in kids}
 
     def cmd_name(cmd: str) -> str:
         parts = cmd.split()
@@ -460,39 +459,47 @@ def ps_by_name(ps_output: str, session_id: str, all_claudes: bool = False) -> di
     if claude_pid is not None:
         claude_pids.add(claude_pid)
 
-    if all_claudes:
-        def under_claude(pid: int) -> bool:
-            parent = parent_of.get(pid)
-            while parent is not None:
-                if parent in claude_pids:
-                    return True
-                parent = parent_of.get(parent)
-            return False
-        roots = sorted(p for p in claude_pids if not under_claude(p))
-    else:
-        roots = [claude_pid] if claude_pid is not None else []
-    if not roots:
-        return None
-
     labels = {p: f"claude:{i + 2}"
               for i, p in enumerate(sorted(p for p in claude_pids if p != claude_pid))}
     if claude_pid is not None:
         labels[claude_pid] = "claude"
 
+    def excluded(pid: int, cmd: str) -> bool:
+        return ("<defunct>" in cmd or pid == 1  # tini/docker-init
+                or cmd.startswith("ps -")       # our own measurement probe
+                or any(p in cmd for p in PS_INFRA))
+
+    if all_claudes:
+        # Container mode: chart EVERY process in the container, not just
+        # claude's descendants — background tasks launched with nohup/setsid
+        # (or whose shell exited) reparent to PID 1 and would otherwise be
+        # invisible. The container boundary is the scope.
+        candidates = list(procs)
+    else:
+        # Host mode: only the bridged claude's subtree (the host runs other,
+        # unrelated claude sessions we must not pull in).
+        if claude_pid is None:
+            return None
+        candidates = []
+        def collect(pid: int) -> None:
+            candidates.append(pid)
+            for kid in children.get(pid, []):
+                collect(kid)
+        collect(claude_pid)
+
     agg: dict[str, tuple[float, int]] = {}
-    def walk(pid: int) -> None:
+    for pid in candidates:
         cpu, rss, _, cmd = procs[pid]
-        if pid not in claude_pids and (any(p in cmd for p in PS_INFRA)
-                                       or "<defunct>" in cmd):
-            return
+        if pid not in claude_pids and excluded(pid, cmd):
+            continue
         label = labels.get(pid) or f"{cmd_name(cmd)}·{pid}"
         agg[label] = (cpu, rss)
-        for kid in children.get(pid, []):
-            walk(kid)
-    for root in roots:
-        walk(root)
-    return agg
+    return agg or None
 
+
+# a process under this RSS with 0% CPU is treated as noise and not charted;
+# above it, an idle process still draws (so you see it's parked, not gone)
+CHART_RSS_FLOOR_KB = 50 * 1024  # 50 MB
 
 # Discord dark-theme embed colors
 CHART_BG = "#2b2d31"      # embed background — chart blends in seamlessly
@@ -562,24 +569,33 @@ def render_chart(samples) -> tuple[bytes, str]:
 
     now = samples[-1][0]
     xs = [(s[0] - now) / 60 for s in samples]  # minutes ago (<= 0)
-    peak: dict[str, float] = {}
+    peak: dict[str, float] = {}      # peak CPU% per label
+    peak_rss: dict[str, int] = {}    # peak RSS (kb) per label
     peak_rss_mb = 0.0
     for _, procs in samples:
         for label, vals in procs.items():
             peak[label] = max(peak.get(label, 0.0), vals[0])
+            peak_rss[label] = max(peak_rss.get(label, 0), vals[1])
             peak_rss_mb = max(peak_rss_mb, vals[1] / 1024)
     # lines are per-PID ("name·pid"), but color and legend group by name
     def group_of(label: str) -> str:
         return label.rsplit("·", 1)[0]
+    # include a process if it burned CPU OR holds real memory — an idle
+    # background process (0% CPU) waiting on something is still worth showing,
+    # so its flat line at zero tells you it's parked, not gone
     group_peak: dict[str, float] = {}
+    group_rss: dict[str, int] = {}
     members: dict[str, list[str]] = {}
-    for label, p in peak.items():
-        if p <= 0:
+    for label in peak:
+        if peak[label] <= 0 and peak_rss[label] < CHART_RSS_FLOOR_KB:
             continue
         grp = group_of(label)
-        group_peak[grp] = max(group_peak.get(grp, 0.0), p)
+        group_peak[grp] = max(group_peak.get(grp, 0.0), peak[label])
+        group_rss[grp] = max(group_rss.get(grp, 0), peak_rss[label])
         members.setdefault(grp, []).append(label)
-    active_groups = sorted(group_peak, key=lambda g: -group_peak[g])
+    # rank by CPU first (active processes lead), then RSS (so a big idle
+    # process still claims a slot ahead of a small idle one)
+    active_groups = sorted(group_peak, key=lambda g: (-group_peak[g], -group_rss[g]))
     shown_groups = active_groups[:len(CHART_COLORS)]
     shown = [lbl for grp in shown_groups for lbl in members[grp]]
 
@@ -829,6 +845,50 @@ def latest_context_tokens(path: Path) -> int | None:
     return best
 
 
+# Built-in extras Claude Code appends to every AskUserQuestion selector —
+# they aren't real choices, so they get no button (the user types instead).
+QUESTION_EXTRAS = ("type something", "chat about this")
+_OPT_RE = re.compile(r"^\s*[❯>]?\s*(\d+)\.\s+(.*\S)\s*$")
+
+
+def parse_question(pane: str):
+    """Detect an interactive choice selector in the live TUI pane and return
+    {header, question, options, cursor} — or None. Pane-based because the
+    transcript's tool_use line only appears AFTER the choice is made.
+
+    Keyed on the selector footer ("Esc to cancel") plus numbered options, so
+    it doesn't fire on the agents/background-tasks panel (which uses a
+    different footer and unnumbered rows)."""
+    low = pane.lower()
+    if "esc to cancel" not in low:
+        return None
+    lines = pane.splitlines()
+    opts, cursor = {}, 1
+    for ln in lines:
+        m = _OPT_RE.match(ln)
+        if m:
+            n = int(m.group(1))
+            opts[n] = m.group(2).strip()
+            if "❯" in ln or ln.lstrip().startswith(">"):
+                cursor = n
+    if len(opts) < 2:
+        return None
+    options = [opts[k] for k in sorted(opts)]
+    header = next((ln.strip(" ☐☑▎").strip() for ln in lines
+                   if ln.lstrip().startswith(("☐", "☑"))), "Question")
+    question = ""
+    for i, ln in enumerate(lines):
+        if _OPT_RE.match(ln):
+            for j in range(i - 1, -1, -1):
+                s = lines[j].strip()
+                if s and not s.startswith(("☐", "☑", "─", "❯", "⏺")):
+                    question = s
+                    break
+            break
+    return {"header": header, "question": question,
+            "options": options, "cursor": cursor}
+
+
 def tool_desc(block: dict) -> str:
     """One-line human description of a tool_use block."""
     name = block.get("name", "tool")
@@ -935,10 +995,9 @@ class TranscriptWatcher:
         if self.on_tool:
             for block in tools:
                 await self.on_tool(tool_desc(block))
-        if self.on_question:  # interactive prompts that block the TUI
-            for block in tools:
-                if block.get("name") in ("AskUserQuestion", "ExitPlanMode"):
-                    await self.on_question(block)
+        # NB: interactive prompts (AskUserQuestion) are detected from the live
+        # TUI pane, not here — their tool_use line only lands in the
+        # transcript AFTER the choice is made, which is too late to relay.
         texts = [b.get("text", "") for b in content
                  if isinstance(b, dict) and b.get("type") == "text"]
         text = "\n\n".join(t for t in texts if t.strip())
@@ -1147,7 +1206,8 @@ def run_bridge(tmux_session: str) -> None:
     async def tui_poller() -> None:
         while True:
             try:
-                match = TOKEN_RE.search(await session.capture())
+                pane = await session.capture()
+                match = TOKEN_RE.search(pane)
                 if match:
                     token_state["spinner"] = True
                     if match.group(1) != token_state["value"]:
@@ -1156,8 +1216,11 @@ def run_bridge(tmux_session: str) -> None:
                 else:
                     token_state["spinner"] = False
                     token_state["value"] = None
+                # interactive choice selectors are detected here (live pane),
+                # not from the transcript, which lags until after the answer
+                await check_question(pane)
             except Exception:
-                pass
+                LOG.exception("tui poller error")
             await asyncio.sleep(3)
 
     def generating() -> bool:
@@ -1179,7 +1242,7 @@ def run_bridge(tmux_session: str) -> None:
                 pass  # container down between sessions etc.
             await asyncio.sleep(10)
 
-    PS_TICK = 15  # reconciler tick; renders follow the decay ladder
+    PS_TICK = 5  # reconciler evaluation cadence; renders follow the decay ladder
     PS_LADDER = (30, 60, 300, 600, 1200, 1800)  # render cadence per rung
     # how long to dwell at each rung before decaying to the next — so the
     # fast cadences persist (e.g. 1-min refresh for 10 min) instead of
@@ -1188,7 +1251,7 @@ def run_bridge(tmux_session: str) -> None:
     # the reaction shows the current cadence; tapping it snaps back to ⚡
     SPEED_EMOJIS = ("⚡", "🐇", "🐈", "🐢", "🐌", "🦥")
 
-    IDLE_AFTER = 60  # auto-open after 1 message-quiet minute while working
+    OPEN_AFTER = 15  # auto-open once Claude's last message is this many seconds old
 
     async def close_monitor(reason: str) -> None:
         if mon["msg"] is not None:
@@ -1269,18 +1332,15 @@ def run_bridge(tmux_session: str) -> None:
 
                 if mon["msg"] is None:
                     mon["last_means"] = means  # keep the baseline current
-                    mid_turn = watcher is not None and watcher.turn_started is not None
-                    subagents = watcher is not None and now - watcher.sidechain_seen < 180
-                    busy_procs = bool(samples) and any(
-                        v[0] >= 10 for k, v in samples[-1][1].items()
-                        if not k.startswith("claude"))
-                    working = mid_turn or subagents or busy_procs
-                    quiet = now - last_activity > IDLE_AFTER
-                    if forced or (working and quiet and not generating()):
-                        reason = ("requested" if forced else
-                                  "turn" if mid_turn else
-                                  "subagent" if subagents else "processes")
-                        LOG.info(f"ps monitor opening ({reason})")
+                    # Open once Claude has gone quiet (no message for
+                    # OPEN_AFTER), unless it's still streaming a reply — when
+                    # it stops talking it's usually running something, and
+                    # this is when you want to see what. Closes again on the
+                    # next reply.
+                    quiet = now - last_activity > OPEN_AFTER
+                    if forced or (quiet and not generating()):
+                        LOG.info("ps monitor opening "
+                                 + ("(requested)" if forced else "(quiet)"))
                         mon["ladder"] = 0
                         mon["rung_since"] = now
                         await render_monitor()
@@ -1322,7 +1382,8 @@ def run_bridge(tmux_session: str) -> None:
     # with buttons, and answer by dismissing the blocking UI (Esc) then
     # steering with the chosen text. Esc-and-steer is uniform and robust: it
     # works for single/multi-select, freeform, and plan prompts alike.
-    pending_q: dict = {"active": False, "msg": None, "options": []}
+    pending_q: dict = {"active": False, "msg": None, "options": [],
+                       "fp": None, "resolving_until": 0.0}
 
     async def dismiss_prompt() -> None:
         await session.interrupt()  # one Esc dismisses the selector / backs out
@@ -1338,7 +1399,38 @@ def run_bridge(tmux_session: str) -> None:
                 await pending_q["msg"].edit(view=None)
             except discord.HTTPException:
                 pass
-        pending_q.update(active=False, msg=None, options=[])
+        pending_q.update(active=False, msg=None, options=[], fp=None,
+                         resolving_until=0.0)
+
+    async def begin_resolving() -> None:
+        """Mark the prompt as being answered: disable the buttons and suppress
+        re-relay for a few seconds while the selector clears from the pane
+        (its fingerprint is kept so the poller dedups it)."""
+        pending_q["active"] = False
+        pending_q["resolving_until"] = time.time() + 5
+        if pending_q["msg"] is not None:
+            try:
+                await pending_q["msg"].edit(view=None)
+            except discord.HTTPException:
+                pass
+
+    async def pick_option(label: str) -> None:
+        """Select an option by navigating the live TUI selector natively:
+        move the cursor from its current row to the target, then Enter — so
+        Claude's tool returns the real choice (not a cancellation)."""
+        opts = pending_q.get("options") or []
+        target = opts.index(label) + 1 if label in opts else None
+        await begin_resolving()
+        q = parse_question(await session.capture()) if target else None
+        if q and target:
+            delta = target - q["cursor"]
+            key = "Down" if delta > 0 else "Up"
+            for _ in range(abs(delta)):
+                await tmux("send-keys", "-t", claude_win(session.name), key)
+                await asyncio.sleep(0.05)
+            await tmux("send-keys", "-t", claude_win(session.name), "Enter")
+        else:  # selector moved on / not found — fall back to escape + steer
+            await answer_prompt(f"My answer: {label}")
 
     def build_question_view(options: list[str]):
         view = discord.ui.View(timeout=None)
@@ -1349,12 +1441,13 @@ def run_bridge(tmux_session: str) -> None:
                     return
                 await interaction.response.defer()
                 LOG.info(f"interactive prompt answered: {label[:40]}")
-                await clear_pending()
-                await answer_prompt(f"My answer: {label}")
-                await interaction.followup.send(f"➡️ answered: {label[:80]}")
+                await pick_option(label)
+                await interaction.followup.send(f"➡️ {label[:80]}")
             return cb
 
         for i, label in enumerate(options[:20]):
+            if label.lower().rstrip(".") in QUESTION_EXTRAS:
+                continue  # "Type something" / "Chat about this" → type instead
             btn = discord.ui.Button(label=f"{i+1}. {label[:72]}",
                                     style=discord.ButtonStyle.primary)
             btn.callback = make_cb(label)
@@ -1365,7 +1458,7 @@ def run_bridge(tmux_session: str) -> None:
                 return
             await interaction.response.defer()
             LOG.info("interactive prompt dismissed (Esc)")
-            await clear_pending()
+            await begin_resolving()
             await dismiss_prompt()
             await interaction.followup.send("✕ dismissed")
         dbtn = discord.ui.Button(label="✕ dismiss (Esc)", style=discord.ButtonStyle.danger)
@@ -1373,39 +1466,38 @@ def run_bridge(tmux_session: str) -> None:
         view.add_item(dbtn)
         return view
 
-    async def on_question(block: dict) -> None:
-        name = block.get("name")
-        inp = block.get("input") or {}
+    async def relay_question(q: dict) -> None:
+        """Relay a TUI choice selector (parsed from the pane) to Discord."""
         try:
-            if name == "AskUserQuestion":
-                qs = inp.get("questions") or []
-                options, lines = [], []
-                for q in qs:
-                    lines.append(f"**{q.get('header','Question')}** — {q.get('question','')}")
-                    for o in q.get("options", []):
-                        lines.append(f"  • {o.get('label','')} — {o.get('description','')[:120]}")
-                        options.append(o.get("label", ""))
-                single = len(qs) == 1 and not qs[0].get("multiSelect")
-                view = build_question_view(options) if single else None
-                if not single:
-                    lines.append("\n-# reply with your answer (text) to send it")
-                header = "❓ **Claude is asking** (interactive prompt — buttons, `!N`, or reply):"
-                body = header + "\n" + "\n".join(lines)
-            else:  # ExitPlanMode
-                plan = inp.get("plan", "")
-                options = ["approve the plan and start implementing"]
-                body = ("📋 **Claude finished planning** — approve to proceed, or reply "
-                        "with changes:\n\n" + plan)
-                view = build_question_view(options)
+            lines = [f"**{q['header']}** — {q['question']}"]
+            for i, label in enumerate(q["options"]):
+                lines.append(f"  {i+1}. {label}")
+            lines.append("-# tap a button, reply `!N`, or type a freeform answer")
+            body = "❓ **Claude is asking:**\n" + "\n".join(lines)
+            view = build_question_view(q["options"])
             channel = await get_chan()
             chunks = chunk_message(body)
             for chunk in chunks[:-1]:
                 await channel.send(chunk)
             msg = await channel.send(chunks[-1], view=view)
-            pending_q.update(active=True, msg=msg if view else None, options=options)
-            LOG.info(f"relayed interactive prompt: {name} ({len(options)} options)")
+            pending_q.update(active=True, msg=msg, options=q["options"],
+                             fp=(q["question"], tuple(q["options"])))
+            LOG.info(f"relayed interactive prompt ({len(q['options'])} options)")
         except discord.HTTPException as err:
             LOG.warning(f"failed to relay interactive prompt: {err}")
+
+    async def check_question(pane: str) -> None:
+        """Poll hook: relay a newly-appeared selector; clear when it's gone."""
+        if time.time() < pending_q.get("resolving_until", 0.0):
+            return  # an answer is in flight; let the selector clear
+        q = parse_question(pane)
+        if q is None:
+            if pending_q["active"] or pending_q.get("fp"):
+                await clear_pending()  # selector resolved / dismissed
+            return
+        fp = (q["question"], tuple(q["options"]))
+        if fp != pending_q.get("fp"):  # a new, not-yet-relayed question
+            await relay_question(q)
 
     async def relay(text: str) -> None:
         # claude's canned no-op when an automated event (e.g. a background
@@ -1507,8 +1599,7 @@ def run_bridge(tmux_session: str) -> None:
         if not watcher_started:
             watcher_started = True
             watcher = TranscriptWatcher(
-                session, relay, on_turn_end=on_turn_end, on_tool=on_tool,
-                on_question=on_question)
+                session, relay, on_turn_end=on_turn_end, on_tool=on_tool)
             asyncio.create_task(sender_loop())
             asyncio.create_task(watcher.run())
             asyncio.create_task(ps_reconciler())
@@ -1556,8 +1647,8 @@ def run_bridge(tmux_session: str) -> None:
                 "chart. Updates fast (30s) while metrics move, decaying to every "
                 "30min when things are steady (⚡🐇🐈🐢🐌🦥 reaction = current speed; "
                 "tap it to snap back to ⚡). Significant changes or any message from "
-                "you also re-engage. React ❌ to close. Auto-opens after 1 "
-                "message-quiet minute mid-turn\n"
+                "you also re-engage. React ❌ to close. Auto-opens whenever "
+                "Claude goes quiet for 15s (unless still generating)\n"
                 "`!tasks` — Claude's task list for this session (🟩 done · 🟨 active · "
                 "⬜ pending)\n"
                 "`!esc` — interrupt the current turn (escapes until the prompt returns)\n"
@@ -1565,6 +1656,7 @@ def run_bridge(tmux_session: str) -> None:
                 "turn continues and queued messages get read\n"
                 "`!clear` — dismiss a stuck interactive prompt (Esc) and un-hose the session\n"
                 "`!url` — re-print the md viewer's cloudflared tunnel link\n"
+                "`!psdebug` — dump raw ps vs what the monitor collects/charts (diagnostic)\n"
                 "`!new` — start a fresh claude session in the same directory\n"
                 "`!status` — session card: workspace, session id, container, transcript\n"
                 "`!/<command>` — send any claude slash command (Discord hijacks bare "
@@ -1615,13 +1707,12 @@ def run_bridge(tmux_session: str) -> None:
             await dismiss_prompt()
             await message.add_reaction("🧹")
             return
-        if pending_q["active"] and re.fullmatch(r"!\d+", content):
-            idx = int(content[1:]) - 1  # !N picks the Nth relayed option
+        if pending_q["active"] and re.fullmatch(r"!?\d+", content):
+            idx = int(content.lstrip("!")) - 1  # N or !N picks the Nth option
             opts = pending_q.get("options") or []
             if 0 <= idx < len(opts):
                 LOG.info(f"interactive prompt answered by number: {idx+1}")
-                await clear_pending()
-                await answer_prompt(f"My answer: {opts[idx]}")
+                await pick_option(opts[idx])
                 await message.add_reaction("✅")
                 return
         if content == "!tasks":
@@ -1633,6 +1724,28 @@ def run_bridge(tmux_session: str) -> None:
             return
         if content == "!ps":
             wake_monitor(force=True)  # reconciler opens/refreshes within a tick
+            return
+        if content == "!psdebug":  # diagnose what the monitor collects vs drops
+            raw = await session.ps_output()
+            in_container = container_enabled(session.config)
+            agg = ps_by_name(raw, session.state["session_id"],
+                             all_claudes=in_container) or {}
+            charted = [f"{k}: {v[0]:.0f}% {v[1]//1024}M" for k, v in agg.items()
+                       if v[0] > 0 or v[1] >= CHART_RSS_FLOOR_KB]
+            dropped = [f"{k}: {v[0]:.0f}% {v[1]//1024}M" for k, v in agg.items()
+                       if not (v[0] > 0 or v[1] >= CHART_RSS_FLOOR_KB)]
+            report = (f"mode: {'container' if in_container else 'host'}\n"
+                      f"session: {session.state['session_id']}\n\n"
+                      f"=== collected by ps_by_name ({len(agg)}) ===\n"
+                      + "\n".join(f"{k}: {v[0]:.0f}% {v[1]//1024}M"
+                                 for k, v in sorted(agg.items()))
+                      + f"\n\n=== charted (cpu>0 or rss>={CHART_RSS_FLOOR_KB//1024}M) "
+                        f"({len(charted)}) ===\n" + "\n".join(charted)
+                      + f"\n\n=== collected-but-below-threshold ({len(dropped)}) ===\n"
+                      + "\n".join(dropped)
+                      + "\n\n=== raw ps ===\n" + raw)
+            enqueue("🔬 ps diagnostic (collected vs charted vs raw)",
+                    file_bytes=report.encode(), filename="psdebug.txt")
             return
         if content == "!status":
             embed = discord.Embed(title="claudebot", color=0xCC785C)
@@ -1695,7 +1808,7 @@ def run_bridge(tmux_session: str) -> None:
                  + (f", {len(message.attachments)} attachment(s)" if message.attachments else ""))
         mid_turn = watcher is not None and watcher.turn_started is not None
         if pending_q["active"]:  # a blocking prompt is up — clear it before pasting
-            await clear_pending()
+            await begin_resolving()
             await dismiss_prompt()
             await asyncio.sleep(0.3)
         await session.send("\n\n".join(parts))
