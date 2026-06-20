@@ -80,6 +80,13 @@ def setup_logging(tmux_session: str) -> None:
     LOG.setLevel(logging.INFO)
 
 
+def default_session_name(cwd: str) -> str:
+    """tmux session name derived from the project dir, so two projects get
+    separate sessions by default instead of one stealing the other's name."""
+    base = re.sub(r"[^A-Za-z0-9_-]+", "-", Path(cwd).name).strip("-_").lower()
+    return base or DEFAULT_SESSION
+
+
 def resolve_config(opts) -> dict:
     """Merge config: ~/.claudebot < ./.claudebot < CLI flags."""
     cfg = {}
@@ -96,7 +103,7 @@ def resolve_config(opts) -> dict:
         cfg["CONTAINER"] = "1"
     if getattr(opts, "no_container", False):
         cfg["CONTAINER"] = "0"
-    cfg.setdefault("TMUX_SESSION", DEFAULT_SESSION)
+    cfg.setdefault("TMUX_SESSION", default_session_name(str(Path.cwd())))
     return cfg
 
 
@@ -173,6 +180,11 @@ def resolve_resume(claude_args: list[str], cfg: dict, work_dir: str):
     return resume_id, args
 
 
+# enabled by default for every claudebot session (experimental in Claude Code;
+# no CLI flag, env-var only) — https://code.claude.com/docs/en/agent-teams
+CLAUDE_ENV = {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}
+
+
 def claude_command(state: dict) -> str:
     session_flag = "--resume" if state.get("resume") else "--session-id"
     cmd = ["claude", session_flag, state["session_id"],
@@ -180,6 +192,7 @@ def claude_command(state: dict) -> str:
     cfg = state["config"]
     if container_enabled(cfg):
         wd = state["work_dir"]
+        env_args = [a for k, v in CLAUDE_ENV.items() for a in ("-e", f"{k}={v}")]
         cmd = ["docker", "run", "--rm", "-it",
                "--init",  # tini as PID 1 to reap zombies (claude isn't an init system)
                "--name", container_name(cfg["TMUX_SESSION"]),
@@ -188,10 +201,13 @@ def claude_command(state: dict) -> str:
                # to the bridged channel
                "-e", f"CLAUDEBOT_DISCORD_TOKEN={cfg.get('DISCORD_TOKEN', '')}",
                "-e", f"CLAUDEBOT_CHANNEL_ID={cfg.get('CHANNEL_ID', '')}",
+               *env_args,
                "-v", f"{CONTAINER_HOME}:/root",
                "-v", f"{UPLOAD_DIR}:{UPLOAD_DIR}",  # same path inside, so paths we tell claude work
                "-v", f"{wd}:{wd}", "-w", wd,
                cfg.get("CONTAINER_IMAGE", DEFAULT_IMAGE), *cmd]
+    else:  # host mode: set the env in the pane before exec'ing claude
+        cmd = ["env", *(f"{k}={v}" for k, v in CLAUDE_ENV.items()), *cmd]
     return " ".join(shlex.quote(c) for c in cmd)
 
 
@@ -319,18 +335,28 @@ def launch(cfg: dict, claude_args: list[str]) -> None:
     name = cfg["TMUX_SESSION"]
     cwd = str(Path.cwd())
 
-    if container_enabled(cfg):
-        if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
-            sys.exit("claudebot: container mode requires docker (is Docker Desktop running?)")
-        cfg["CONTAINER_IMAGE"] = resolve_image(cfg, cwd)  # persists via state for !new
-        CONTAINER_HOME.mkdir(exist_ok=True)
+    # Re-attach / collision check first (before any expensive image build).
     if tmux_sync("has-session", "-t", session_t(name)) == 0:
         state = load_state(name)
         if state.get("work_dir") == cwd:
             print(f"claudebot already running in {cwd} — attaching (ctrl-b d to detach)")
             attach(name)
-        print(f"claudebot '{name}' was running in {state.get('work_dir', '?')} — replacing it")
-        tmux_sync("kill-session", "-t", session_t(name))
+        # Same session name, different project — refuse rather than kill the
+        # other session out from under it. Each project gets its own name by
+        # default (the dir basename); override to disambiguate a collision.
+        sys.exit(
+            f"claudebot: tmux session '{name}' is already running in "
+            f"{state.get('work_dir', '?')}.\n"
+            f"To run a second session, give this one a distinct name:\n"
+            f"  claudebot --tmux-session {name}-2\n"
+            f"or set TMUX_SESSION in ./.claudebot. "
+            f"To take it over, run 'claudebot --stop' there first.")
+
+    if container_enabled(cfg):
+        if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+            sys.exit("claudebot: container mode requires docker (is Docker Desktop running?)")
+        cfg["CONTAINER_IMAGE"] = resolve_image(cfg, cwd)  # persists via state for !new
+        CONTAINER_HOME.mkdir(exist_ok=True)
 
     resume_id, claude_args = resolve_resume(claude_args, cfg, cwd)
     session_id = resume_id or str(uuid.uuid4())
@@ -863,30 +889,56 @@ def parse_question(pane: str):
     if "esc to cancel" not in low:
         return None
     lines = pane.splitlines()
+    footer_i = max(i for i, l in enumerate(lines) if "esc to cancel" in l.lower())
+
+    # Bound option parsing to the selector's box. Rich prompts (with a
+    # side-by-side preview panel) wrap the options in full-width ─ rules;
+    # restricting to that region excludes numbered lists in Claude's prose
+    # above (which were being picked up as bogus options).
+    def is_rule(l: str) -> bool:
+        s = l.strip()
+        return len(s) >= 8 and set(s) <= {"─"}
+    rules = [i for i in range(footer_i) if is_rule(lines[i])]
+    if len(rules) >= 2:
+        region = range(rules[-2] + 1, rules[-1])
+    else:
+        region = range(0, footer_i)
+
+    # Strip a side-by-side preview panel: cut the label at the first
+    # box-drawing glyph (the preview box border shares the option's line).
+    def strip_preview(label: str) -> str:
+        return re.split(r"[─-╿]", label, maxsplit=1)[0].strip()
+
     opts, cursor = {}, 1
-    for ln in lines:
+    for i in region:
+        ln = lines[i]
         m = _OPT_RE.match(ln)
         if m:
+            label = strip_preview(m.group(2))
+            if not label:
+                continue
             n = int(m.group(1))
-            opts[n] = m.group(2).strip()
+            opts[n] = label
             if "❯" in ln or ln.lstrip().startswith(">"):
                 cursor = n
     if len(opts) < 2:
         return None
     options = [opts[k] for k in sorted(opts)]
-    header = next((ln.strip(" ☐☑▎").strip() for ln in lines
-                   if ln.lstrip().startswith(("☐", "☑"))), "Question")
+
+    # question = the line just above the first option (skip tab bar / chrome)
     question = ""
-    for i, ln in enumerate(lines):
-        if _OPT_RE.match(ln):
-            for j in range(i - 1, -1, -1):
-                s = lines[j].strip()
-                if s and not s.startswith(("☐", "☑", "─", "❯", "⏺")):
-                    question = s
-                    break
-            break
-    return {"header": header, "question": question,
-            "options": options, "cursor": cursor}
+    first_opt = next((i for i in region if _OPT_RE.match(lines[i])), None)
+    if first_opt is not None:
+        for j in range(first_opt - 1, -1, -1):
+            s = lines[j].strip()
+            if s and not s.startswith(("☐", "☑", "─", "❯", "⏺", "←")):
+                question = s
+                break
+    hm = re.search(r"[☐☑]\s*([^☐☑✔→]+)", "\n".join(lines[r] for r in region))
+    header = hm.group(1).strip() if hm else "Question"
+    multi = "tab to switch questions" in low
+    return {"header": header, "question": question, "options": options,
+            "cursor": cursor, "multi": multi}
 
 
 def tool_desc(block: dict) -> str:
@@ -1473,6 +1525,9 @@ def run_bridge(tmux_session: str) -> None:
             for i, label in enumerate(q["options"]):
                 lines.append(f"  {i+1}. {label}")
             lines.append("-# tap a button, reply `!N`, or type a freeform answer")
+            if q.get("multi"):
+                lines.append("-# ⚠️ multi-question prompt — buttons answer *this* "
+                             "question; the next one will relay after")
             body = "❓ **Claude is asking:**\n" + "\n".join(lines)
             view = build_question_view(q["options"])
             channel = await get_chan()
@@ -1521,24 +1576,31 @@ def run_bridge(tmux_session: str) -> None:
             enqueue(chunk)
 
     # --- live tool-status message: one message edited as tools run -------
-    tool_log: deque[str] = deque(maxlen=5)
+    turn_tools: list[str] = []  # every tool this turn (persisted at turn end)
     status_msg: discord.Message | None = None
     last_status_edit = 0.0
+    STATUS_MAX_TOOLS = 15  # cap the persisted list so the message fits
 
-    def render_status() -> str:
-        return "\n".join(["⚙️ **working**"] + [f"-# 🔧 {d}" for d in tool_log])
+    def render_status(header: str, full: bool = False) -> str:
+        shown = turn_tools if full else turn_tools[-5:]
+        lines = [header]
+        if full and len(turn_tools) > STATUS_MAX_TOOLS:
+            shown = turn_tools[-STATUS_MAX_TOOLS:]
+            lines.append(f"-# (+{len(turn_tools) - STATUS_MAX_TOOLS} earlier)")
+        lines += [f"-# 🔧 {d}" for d in shown]
+        return "\n".join(lines)
 
     async def on_tool(desc: str) -> None:
         # NB: deliberately does NOT touch() the idle timer — background-task
         # polling produces steady tool events, and the monitor should open on
         # "no messages for a while" even when tools are ticking
         nonlocal status_msg, last_status_edit
-        tool_log.append(desc)
+        turn_tools.append(desc)
         try:
             if status_msg is None:
-                status_msg = await (await get_chan()).send(render_status())
+                status_msg = await (await get_chan()).send(render_status("⚙️ **working**"))
             elif time.time() - last_status_edit > 1.5:  # respect edit rate limits
-                await status_msg.edit(content=render_status())
+                await status_msg.edit(content=render_status("⚙️ **working**"))
             else:
                 return
             last_status_edit = time.time()
@@ -1546,14 +1608,17 @@ def run_bridge(tmux_session: str) -> None:
             pass
 
     async def finalize_status(line: str) -> None:
+        # keep the tool list visible — just swap the "working" header for the
+        # summary line, so the record of what Claude did persists
         nonlocal status_msg
         if status_msg is not None:
             try:
-                await status_msg.edit(content=line)
+                content = (render_status(line, full=True) if turn_tools else line)
+                await status_msg.edit(content=content)
             except discord.HTTPException:
                 pass
             status_msg = None
-        tool_log.clear()
+        turn_tools.clear()
 
     async def on_turn_end(stats: dict) -> None:
         ctx_tokens = (watcher.context_tokens or 0) if watcher else 0
@@ -1840,7 +1905,9 @@ def main() -> None:
                         help="Discord channel/thread NAME to bridge (looked up "
                              "via the bot token across the bot's guilds)")
     parser.add_argument("--user-id", help="Discord user ID allowed to talk to Claude")
-    parser.add_argument("--tmux-session", help=f"tmux session name (default: {DEFAULT_SESSION})")
+    parser.add_argument("--tmux-session",
+                        help="tmux session name (default: the project dir name; "
+                             "each dir runs its own session concurrently)")
     parser.add_argument("--container", action="store_true",
                         help="run claude inside a docker container (as root)")
     parser.add_argument("--no-container", action="store_true",

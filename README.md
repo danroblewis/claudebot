@@ -23,10 +23,16 @@ session id is shown by `!status` and in `~/.claudebot-sessions.json`).
 
 Unrecognized options are passed through to claude
 (e.g. `claudebot --model opus`). Detach with `ctrl-b d`; everything keeps
-running and stays usable from Discord. Running `claudebot` again in the same
-directory re-attaches; in a different directory it replaces the session
-(unless you give the projects different `TMUX_SESSION` names — then they run
-concurrently, each bridging its own channel).
+running and stays usable from Discord.
+
+Each project runs its **own** session: the tmux session name defaults to the
+working directory's name, so `claudebot` in `~/foo` and `~/bar` run
+concurrently (sessions `foo` and `bar`), each bridging its own channel.
+Running `claudebot` again in the same directory re-attaches. If two different
+directories would collide on a name (or you want two sessions in one dir),
+pass `--tmux-session NAME`. claudebot will **refuse** to start over a session
+of the same name running a different directory rather than kill it — stop that
+one first with `claudebot --stop`.
 
 ## Configuration
 
@@ -46,7 +52,7 @@ and active threads; errors with a list if the name is ambiguous).
 | `DISCORD_TOKEN` | Bot token (Developer Portal → Bot → Token) |
 | `CHANNEL_ID` | Channel **or thread** ID the bridge listens in / replies to |
 | `USER_ID` | Your Discord user ID — only your messages are forwarded |
-| `TMUX_SESSION` | tmux session name (default `claudebot`) |
+| `TMUX_SESSION` | tmux session name (default: the project dir name; each dir runs its own session) |
 | `CONTAINER` | `1` to run claude inside docker (flags: `--container` / `--no-container`) |
 | `CONTAINER_IMAGE` | existing docker image to use as-is (no build) |
 | `DOCKERFILE` | Dockerfile to build the container image from |
@@ -142,6 +148,9 @@ pinned Z3 on top of this pattern)
   its logs live there — `ctrl-b n` to peek).
 - The fixed session id makes the transcript path deterministic:
   `~/.claude/projects/<munged-work-dir>/<session-id>.jsonl`.
+- [Agent teams](https://code.claude.com/docs/en/agent-teams) are enabled for
+  every session (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, injected at launch
+  in host mode and via `docker run -e` in container mode).
 - Incoming Discord messages (from your `USER_ID`, in `CHANNEL_ID`) are
   injected via tmux bracketed paste + Enter.
 - The bridge tails the transcript, picks out assistant `text` blocks (skipping
