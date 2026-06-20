@@ -103,6 +103,7 @@ def resolve_config(opts) -> dict:
         cfg["CONTAINER"] = "1"
     if getattr(opts, "no_container", False):
         cfg["CONTAINER"] = "0"
+    cfg.setdefault("CONTAINER", "1")  # container mode on by default (--no-container to opt out)
     cfg.setdefault("TMUX_SESSION", default_session_name(str(Path.cwd())))
     return cfg
 
@@ -1909,9 +1910,9 @@ def main() -> None:
                         help="tmux session name (default: the project dir name; "
                              "each dir runs its own session concurrently)")
     parser.add_argument("--container", action="store_true",
-                        help="run claude inside a docker container (as root)")
+                        help="run claude inside a docker container, as root (default on)")
     parser.add_argument("--no-container", action="store_true",
-                        help="override CONTAINER=1 from a config file")
+                        help="run claude on the host instead of in a container")
     parser.add_argument("--container-image",
                         help="existing docker image to use for --container (no build)")
     parser.add_argument("--dockerfile",

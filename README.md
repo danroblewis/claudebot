@@ -53,15 +53,16 @@ and active threads; errors with a list if the name is ambiguous).
 | `CHANNEL_ID` | Channel **or thread** ID the bridge listens in / replies to |
 | `USER_ID` | Your Discord user ID — only your messages are forwarded |
 | `TMUX_SESSION` | tmux session name (default: the project dir name; each dir runs its own session) |
-| `CONTAINER` | `1` to run claude inside docker (flags: `--container` / `--no-container`) |
+| `CONTAINER` | docker container mode — on by default; `0` to run on the host (flags: `--container` / `--no-container`) |
 | `CONTAINER_IMAGE` | existing docker image to use as-is (no build) |
 | `DOCKERFILE` | Dockerfile to build the container image from |
 
 ## Container mode
 
-`claudebot --container` (or `CONTAINER=1` in a `.claudebot` file) runs the
-claude process inside a docker container **as root**, so it can `apt-get
-install` / `npm i -g` whatever it needs without touching the host:
+Container mode is **on by default** — claudebot runs the claude process inside
+a docker container **as root**, so it can `apt-get install` / `npm i -g`
+whatever it needs without touching the host. Pass `--no-container` (or set
+`CONTAINER=0` in a `.claudebot` file) to run on the host instead:
 
 - the project dir is bind-mounted at the same path; the bridge stays on the
   host and everything (attach, Discord, `!new`, `!esc`) works the same
