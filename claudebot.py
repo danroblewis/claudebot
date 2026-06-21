@@ -1904,6 +1904,336 @@ def run_bridge(tmux_session: str) -> None:
     client.run(cfg["DISCORD_TOKEN"])
 
 
+# ===========================================================================
+# Discord proxy — one process owns the bot connection; sessions talk to it
+# over a Unix socket. The proxy is GENERIC: its only job is to send to / receive
+# from Discord and route by channel. It holds no bridge logic (no tmux, no
+# transcripts) — sessions keep all of that and use ProxyClient as their handle.
+# Protocol: newline-delimited JSON; binary (images) base64 in `file.data`.
+# ===========================================================================
+
+PROXY_SOCK = str(Path.home() / ".claudebot-discord-proxy.sock")
+
+
+async def _send_frame(writer, obj: dict) -> None:
+    writer.write((json.dumps(obj) + "\n").encode())
+    await writer.drain()
+
+
+async def _read_frame(reader):
+    line = await reader.readline()
+    return json.loads(line) if line else None
+
+
+def file_payload(name: str, data: bytes) -> dict:
+    import base64
+    return {"name": name, "data": base64.b64encode(data).decode()}
+
+
+def run_proxy() -> None:
+    """The standalone Discord proxy daemon (`claudebot --discord-proxy`)."""
+    import base64
+    import io as _io
+
+    import discord
+
+    setup_logging("proxy")
+    token = next((st.get("config", {}).get("DISCORD_TOKEN")
+                  for st in _read_sessions().values()
+                  if st.get("config", {}).get("DISCORD_TOKEN")), None) \
+        or dotenv_values(GLOBAL_CONFIG).get("DISCORD_TOKEN")
+    if not token:
+        sys.exit("claudebot proxy: no DISCORD_TOKEN found")
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    client = discord.Client(intents=intents)
+
+    subs: dict[int, set] = {}          # channel_id -> {writer}
+    owner: dict[int, object] = {}      # message_id -> writer that created it
+    cache: dict[int, object] = {}      # message_id -> discord.Message
+    interactions: dict[int, object] = {}  # interaction_id -> discord.Interaction
+    iid = [0]
+
+    STYLES = {"primary": discord.ButtonStyle.primary,
+              "danger": discord.ButtonStyle.danger,
+              "secondary": discord.ButtonStyle.secondary}
+
+    def build_embed(d):
+        if not d:
+            return discord.utils.MISSING
+        e = discord.Embed(description=d.get("description") or None, color=d.get("color", 0))
+        if d.get("footer"):
+            e.set_footer(text=d["footer"])
+        if d.get("image"):
+            e.set_image(url=d["image"])
+        for f in d.get("fields", []):
+            e.add_field(name=f["name"], value=f["value"], inline=f.get("inline", False))
+        return e
+
+    def build_file(f):
+        if not f:
+            return discord.utils.MISSING
+        return discord.File(_io.BytesIO(base64.b64decode(f["data"])), f["name"])
+
+    def build_view(buttons):
+        if not buttons:
+            return discord.utils.MISSING
+        view = discord.ui.View(timeout=None)
+        for b in buttons:
+            btn = discord.ui.Button(label=b["label"][:80],
+                                    style=STYLES.get(b.get("style"), discord.ButtonStyle.primary),
+                                    custom_id=b["custom_id"])
+
+            async def cb(interaction, cid=b["custom_id"]):
+                await interaction.response.defer()  # ack within 3s
+                iid[0] += 1
+                interactions[iid[0]] = interaction
+                w = owner.get(interaction.message.id)
+                if w is not None:
+                    try:
+                        await _send_frame(w, {"type": "interaction", "interaction_id": iid[0],
+                                              "custom_id": cid, "message_id": interaction.message.id,
+                                              "user_id": interaction.user.id})
+                    except Exception:
+                        pass
+            btn.callback = cb
+            view.add_item(btn)
+        return view
+
+    async def get_msg(message_id, channel_id=None):
+        m = cache.get(message_id)
+        if m is not None:
+            return m
+        if channel_id:
+            ch = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+            m = await ch.fetch_message(message_id)
+            cache[message_id] = m
+            return m
+        return None
+
+    @client.event
+    async def on_ready():
+        LOG.info(f"proxy logged in as {client.user}")
+
+    @client.event
+    async def on_message(message):
+        for w in list(subs.get(message.channel.id, ())):
+            try:
+                await _send_frame(w, {
+                    "type": "message", "channel_id": message.channel.id,
+                    "message_id": message.id, "author_id": message.author.id,
+                    "author_bot": message.author.bot, "content": message.content,
+                    "attachments": [{"filename": a.filename, "url": a.url}
+                                    for a in message.attachments]})
+            except Exception:
+                pass
+
+    @client.event
+    async def on_raw_reaction_add(payload):
+        for w in list(subs.get(payload.channel_id, ())):
+            try:
+                await _send_frame(w, {"type": "reaction", "channel_id": payload.channel_id,
+                                      "message_id": payload.message_id,
+                                      "user_id": payload.user_id, "emoji": str(payload.emoji)})
+            except Exception:
+                pass
+
+    async def handle_cmd(cmd, writer):
+        t = cmd.get("type")
+        if t == "subscribe":
+            subs.setdefault(int(cmd["channel_id"]), set()).add(writer)
+            return
+        if t == "send":
+            ch = client.get_channel(int(cmd["channel_id"])) or \
+                await client.fetch_channel(int(cmd["channel_id"]))
+            sent = await ch.send(cmd.get("content") or None,
+                                 embed=build_embed(cmd.get("embed")),
+                                 file=build_file(cmd.get("file")),
+                                 view=build_view(cmd.get("buttons")))
+            cache[sent.id] = sent
+            owner[sent.id] = writer
+            if cmd.get("id"):
+                await _send_frame(writer, {"type": "result", "id": cmd["id"], "message_id": sent.id})
+        elif t == "edit":
+            m = await get_msg(int(cmd["message_id"]), cmd.get("channel_id"))
+            if m:
+                kw = {}
+                if "content" in cmd:
+                    kw["content"] = cmd["content"]
+                if "embed" in cmd:
+                    kw["embed"] = build_embed(cmd["embed"])
+                if cmd.get("attachments") is not None:
+                    kw["attachments"] = [build_file(a) for a in cmd["attachments"]]
+                if cmd.get("clear_view"):
+                    kw["view"] = None
+                try:
+                    await m.edit(**kw)
+                except discord.HTTPException:
+                    pass
+            if cmd.get("id"):
+                await _send_frame(writer, {"type": "result", "id": cmd["id"]})
+        elif t == "delete":
+            cache.pop(int(cmd["message_id"]), None)
+            owner.pop(int(cmd["message_id"]), None)
+            m = await get_msg(int(cmd["message_id"]), cmd.get("channel_id"))
+            if m:
+                try:
+                    await m.delete()
+                except discord.HTTPException:
+                    pass
+        elif t == "react":
+            m = await get_msg(int(cmd["message_id"]), cmd.get("channel_id"))
+            if m:
+                try:
+                    await m.add_reaction(cmd["emoji"])
+                except discord.HTTPException:
+                    pass
+        elif t == "unreact":
+            m = await get_msg(int(cmd["message_id"]), cmd.get("channel_id"))
+            if m:
+                try:
+                    await m.remove_reaction(cmd["emoji"], discord.Object(id=int(cmd["user_id"])))
+                except discord.HTTPException:
+                    pass
+        elif t == "typing":
+            ch = client.get_channel(int(cmd["channel_id"]))
+            if ch:
+                try:
+                    await ch.typing()
+                except discord.HTTPException:
+                    pass
+        elif t == "interaction_followup":
+            it = interactions.pop(int(cmd["interaction_id"]), None)
+            if it and cmd.get("content"):
+                try:
+                    await it.followup.send(cmd["content"])
+                except discord.HTTPException:
+                    pass
+
+    async def handle_conn(reader, writer):
+        try:
+            while True:
+                cmd = await _read_frame(reader)
+                if cmd is None:
+                    break
+                try:
+                    await handle_cmd(cmd, writer)
+                except Exception:
+                    LOG.exception("proxy command error")
+        finally:
+            for ws in subs.values():
+                ws.discard(writer)
+            writer.close()
+
+    async def main_async():
+        if os.path.exists(PROXY_SOCK):
+            os.unlink(PROXY_SOCK)
+        server = await asyncio.start_unix_server(handle_conn, PROXY_SOCK)
+        LOG.info(f"proxy listening on {PROXY_SOCK}")
+        async with server:
+            await client.start(token)
+
+    try:
+        asyncio.run(main_async())
+    finally:
+        if os.path.exists(PROXY_SOCK):
+            os.unlink(PROXY_SOCK)
+
+
+class ProxyClient:
+    """A session's handle to the Discord proxy. Mirrors the slice of discord.py
+    the bridge uses; every call is an RPC to the proxy over the Unix socket.
+    Set on_message / on_reaction / on_interaction / on_close callbacks."""
+
+    def __init__(self, sock_path: str = PROXY_SOCK) -> None:
+        self.sock_path = sock_path
+        self.reader = self.writer = None
+        self._req = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self.on_message = self.on_reaction = self.on_interaction = self.on_close = None
+
+    async def connect(self) -> bool:
+        try:
+            self.reader, self.writer = await asyncio.open_unix_connection(self.sock_path)
+        except (OSError, FileNotFoundError):
+            return False
+        asyncio.create_task(self._recv_loop())
+        return True
+
+    async def _recv_loop(self) -> None:
+        while True:
+            try:
+                msg = await _read_frame(self.reader)
+            except (ConnectionError, json.JSONDecodeError):
+                msg = None
+            if msg is None:
+                break
+            t = msg.get("type")
+            if t == "result":
+                fut = self._pending.pop(msg.get("id"), None)
+                if fut and not fut.done():
+                    fut.set_result(msg)
+            elif t == "message" and self.on_message:
+                await self.on_message(msg)
+            elif t == "reaction" and self.on_reaction:
+                await self.on_reaction(msg)
+            elif t == "interaction" and self.on_interaction:
+                await self.on_interaction(msg)
+        if self.on_close:
+            await self.on_close()
+
+    async def _call(self, obj: dict, want_result: bool = False):
+        if want_result:
+            self._req += 1
+            obj["id"] = self._req
+            fut = asyncio.get_event_loop().create_future()
+            self._pending[self._req] = fut
+            await _send_frame(self.writer, obj)
+            return await asyncio.wait_for(fut, 30)
+        await _send_frame(self.writer, obj)
+        return None
+
+    async def subscribe(self, channel_id: int):
+        await self._call({"type": "subscribe", "channel_id": channel_id})
+
+    async def send(self, channel_id, content=None, embed=None, file=None, buttons=None) -> int:
+        r = await self._call({"type": "send", "channel_id": channel_id, "content": content,
+                              "embed": embed, "file": file, "buttons": buttons}, want_result=True)
+        return r["message_id"]
+
+    async def edit(self, message_id, channel_id=None, content=..., embed=..., attachments=None,
+                   clear_view=False):
+        cmd = {"type": "edit", "message_id": message_id, "channel_id": channel_id}
+        if content is not ...:
+            cmd["content"] = content
+        if embed is not ...:
+            cmd["embed"] = embed
+        if attachments is not None:
+            cmd["attachments"] = attachments
+        if clear_view:
+            cmd["clear_view"] = True
+        await self._call(cmd)
+
+    async def delete(self, message_id, channel_id=None):
+        await self._call({"type": "delete", "message_id": message_id, "channel_id": channel_id})
+
+    async def add_reaction(self, message_id, emoji, channel_id=None):
+        await self._call({"type": "react", "message_id": message_id, "emoji": emoji,
+                          "channel_id": channel_id})
+
+    async def remove_reaction(self, message_id, emoji, user_id, channel_id=None):
+        await self._call({"type": "unreact", "message_id": message_id, "emoji": emoji,
+                          "user_id": user_id, "channel_id": channel_id})
+
+    async def typing(self, channel_id):
+        await self._call({"type": "typing", "channel_id": channel_id})
+
+    async def interaction_followup(self, interaction_id, content):
+        await self._call({"type": "interaction_followup", "interaction_id": interaction_id,
+                          "content": content})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="claudebot", allow_abbrev=False,
@@ -1934,8 +2264,12 @@ def main() -> None:
     parser.add_argument("--stop", action="store_true",
                         help="tear down the claudebot tmux session")
     parser.add_argument("--bridge", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--discord-proxy", action="store_true", help=argparse.SUPPRESS)
     opts, claude_args = parser.parse_known_args()
 
+    if opts.discord_proxy:
+        run_proxy()
+        return
     if opts.bridge:
         run_bridge(opts.tmux_session or DEFAULT_SESSION)
         return
