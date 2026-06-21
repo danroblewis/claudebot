@@ -24,6 +24,7 @@ under ~/.claude/projects — back to the Discord channel).
 
 import argparse
 import asyncio
+import fcntl
 import io
 import json
 import logging
@@ -1192,9 +1193,9 @@ def run_bridge(tmux_session: str) -> None:
     channel_id = int(cfg["CHANNEL_ID"])
     user_id = int(cfg["USER_ID"])
 
-    intents = discord.Intents.default()
-    intents.message_content = True
-    client = discord.Client(intents=intents)
+    # talk to Discord through the shared proxy (spawned on demand) instead of
+    # opening our own gateway connection — ProxyClient quacks like discord.Client
+    client = ProxyClient(channel_id, user_id)
     watcher_started = False
 
     WORKING = "👀"  # fresh turn; 📨 = queued into an already-running turn
@@ -1901,7 +1902,7 @@ def run_bridge(tmux_session: str) -> None:
         except discord.HTTPException:
             pass  # cosmetic only — the message was already delivered
 
-    client.run(cfg["DISCORD_TOKEN"])
+    client.run()
 
 
 # ===========================================================================
@@ -1960,16 +1961,8 @@ def run_proxy() -> None:
               "secondary": discord.ButtonStyle.secondary}
 
     def build_embed(d):
-        if not d:
-            return discord.utils.MISSING
-        e = discord.Embed(description=d.get("description") or None, color=d.get("color", 0))
-        if d.get("footer"):
-            e.set_footer(text=d["footer"])
-        if d.get("image"):
-            e.set_image(url=d["image"])
-        for f in d.get("fields", []):
-            e.add_field(name=f["name"], value=f["value"], inline=f.get("inline", False))
-        return e
+        # the wire format is discord's own Embed.to_dict() shape
+        return discord.Embed.from_dict(d) if d else discord.utils.MISSING
 
     def build_file(f):
         if not f:
@@ -2092,10 +2085,18 @@ def run_proxy() -> None:
         elif t == "unreact":
             m = await get_msg(int(cmd["message_id"]), cmd.get("channel_id"))
             if m:
+                # the bot's own reaction must go via the @me path (client.user),
+                # not the user-id path (which needs Manage Messages)
+                uid = int(cmd["user_id"])
+                who = client.user if (client.user and uid == client.user.id) \
+                    else discord.Object(id=uid)
                 try:
-                    await m.remove_reaction(cmd["emoji"], discord.Object(id=int(cmd["user_id"])))
+                    await m.remove_reaction(cmd["emoji"], who)
                 except discord.HTTPException:
                     pass
+        elif t == "whoami":
+            await _send_frame(writer, {"type": "result", "id": cmd.get("id"),
+                                       "user_id": client.user.id if client.user else 0})
         elif t == "typing":
             ch = client.get_channel(int(cmd["channel_id"]))
             if ch:
@@ -2141,10 +2142,10 @@ def run_proxy() -> None:
             os.unlink(PROXY_SOCK)
 
 
-class ProxyClient:
-    """A session's handle to the Discord proxy. Mirrors the slice of discord.py
-    the bridge uses; every call is an RPC to the proxy over the Unix socket.
-    Set on_message / on_reaction / on_interaction / on_close callbacks."""
+class _ProxyConn:
+    """Raw socket transport to the proxy: one method per protocol command, and
+    a recv loop dispatching result/message/reaction/interaction to callbacks.
+    The discord-quacking ProxyClient is layered on top of this."""
 
     def __init__(self, sock_path: str = PROXY_SOCK) -> None:
         self.sock_path = sock_path
@@ -2232,6 +2233,261 @@ class ProxyClient:
     async def interaction_followup(self, interaction_id, content):
         await self._call({"type": "interaction_followup", "interaction_id": interaction_id,
                           "content": content})
+
+    async def whoami(self):
+        return await self._call({"type": "whoami"}, want_result=True)
+
+
+# --- discord.py-quacking shim over the raw transport -----------------------
+# These let the bridge keep calling channel.send()/msg.edit()/@client.event/etc.
+# unchanged; each call is really an RPC to the proxy.
+
+def _embed_to_dict(embed):
+    import discord
+    if embed is None or embed is discord.utils.MISSING:
+        return None
+    return embed.to_dict()
+
+
+def _file_to_payload(file):
+    import discord
+    if file is None or file is discord.utils.MISSING:
+        return None
+    data = file.fp.read()
+    file.fp.seek(0)
+    return file_payload(file.filename, data)
+
+
+def _view_to_specs(view):
+    import discord
+    if view is None or view is discord.utils.MISSING:
+        return None
+    specs, cbs = [], {}
+    style_name = {discord.ButtonStyle.primary: "primary",
+                  discord.ButtonStyle.danger: "danger",
+                  discord.ButtonStyle.secondary: "secondary"}
+    for child in view.children:
+        specs.append({"label": child.label, "custom_id": child.custom_id,
+                      "style": style_name.get(child.style, "primary")})
+        cbs[child.custom_id] = child.callback
+    return specs, cbs
+
+
+class _InAttachment:
+    def __init__(self, filename, url):
+        self.filename, self.url = filename, url
+
+    async def save(self, dest):
+        import urllib.request
+        await asyncio.to_thread(urllib.request.urlretrieve, self.url, str(dest))
+
+
+class _Author:
+    def __init__(self, uid, bot):
+        self.id, self.bot = uid, bot
+
+    def __str__(self):
+        return f"bot#{self.id}" if self.bot else f"user#{self.id}"
+
+
+class _Channel:
+    def __init__(self, px, cid):
+        self._px, self.id = px, cid
+
+    async def send(self, content=None, *, embed=None, file=None, view=None):
+        specs = _view_to_specs(view)
+        mid = await self._px._conn.send(
+            self.id, content=content or None, embed=_embed_to_dict(embed),
+            file=_file_to_payload(file), buttons=specs[0] if specs else None)
+        if specs:
+            self._px._view_cbs[mid] = specs[1]
+        return _Message(self._px, self.id, mid)
+
+    def typing(self):
+        return _Typing(self._px, self.id)
+
+
+class _Typing:
+    def __init__(self, px, cid):
+        self._px, self.cid, self._task = px, cid, None
+
+    async def _loop(self):
+        while True:
+            await self._px._conn.typing(self.cid)
+            await asyncio.sleep(8)
+
+    async def __aenter__(self):
+        self._task = asyncio.create_task(self._loop())
+        return self
+
+    async def __aexit__(self, *a):
+        if self._task:
+            self._task.cancel()
+
+
+class _Message:
+    """Quacks like discord.Message for the bits the bridge uses."""
+    def __init__(self, px, channel_id, mid, author=None, content="", attachments=()):
+        self._px, self.id = px, mid
+        self.channel = _Channel(px, channel_id)
+        self.author = author
+        self.content = content
+        self.attachments = attachments
+
+    async def edit(self, *, content=..., embed=..., attachments=None, view=...):
+        import discord
+        kw = {}
+        if content is not ...:
+            kw["content"] = content
+        if embed is not ...:
+            kw["embed"] = _embed_to_dict(embed)
+        if attachments is not None:
+            kw["attachments"] = [_file_to_payload(f) for f in attachments]
+        if view is None:
+            kw["clear_view"] = True
+        await self._px._conn.edit(self.id, channel_id=self.channel.id, **kw)
+
+    async def delete(self):
+        await self._px._conn.delete(self.id, channel_id=self.channel.id)
+
+    async def add_reaction(self, emoji):
+        await self._px._conn.add_reaction(self.id, str(emoji), channel_id=self.channel.id)
+
+    async def remove_reaction(self, emoji, member):
+        await self._px._conn.remove_reaction(self.id, str(emoji), member.id,
+                                             channel_id=self.channel.id)
+
+
+class _Interaction:
+    """Quacks like discord.Interaction; defer() is a no-op (proxy already
+    deferred) and followup.send() round-trips to the proxy."""
+    def __init__(self, px, iid, user_id, message):
+        self._px, self._iid = px, iid
+        self.user = _Author(user_id, False)
+        self.message = message
+
+        class _Resp:
+            async def defer(_self):
+                pass
+        class _Follow:
+            async def send(_self, content):
+                await px._conn.interaction_followup(iid, content)
+        self.response = _Resp()
+        self.followup = _Follow()
+
+
+class _ReactionPayload:
+    def __init__(self, channel_id, message_id, user_id, emoji):
+        self.channel_id, self.message_id = channel_id, message_id
+        self.user_id, self.emoji = user_id, emoji
+
+
+class ProxyClient:
+    """Quacks like discord.Client for the slice the bridge uses. Spawns/connects
+    the proxy, subscribes to the session's channel, and dispatches inbound
+    events (wrapped as _Message/_Interaction/_ReactionPayload) to handlers
+    registered with @client.event."""
+
+    def __init__(self, channel_id: int, user_id: int, sock_path: str = PROXY_SOCK):
+        self.channel_id, self.user_id = channel_id, user_id
+        self._conn = _ProxyConn(sock_path)
+        self._handlers: dict = {}
+        self._view_cbs: dict = {}   # message_id -> {custom_id: callback}
+        self.user = _Author(0, True)
+
+    # discord.Client surface ------------------------------------------------
+    def event(self, coro):
+        self._handlers[coro.__name__] = coro
+        return coro
+
+    def get_channel(self, cid):
+        return _Channel(self, cid)
+
+    async def fetch_channel(self, cid):
+        return _Channel(self, cid)
+
+    def run(self, token=None):
+        try:
+            asyncio.run(self._main())
+        except KeyboardInterrupt:
+            pass
+
+    # internals -------------------------------------------------------------
+    async def _dispatch(self, name, *args):
+        h = self._handlers.get(name)
+        if h:
+            try:
+                await h(*args)
+            except Exception:
+                LOG.exception(f"handler {name} failed")
+
+    async def _on_message(self, evt):
+        msg = _Message(self, evt["channel_id"], evt["message_id"],
+                       author=_Author(evt["author_id"], evt["author_bot"]),
+                       content=evt["content"],
+                       attachments=[_InAttachment(a["filename"], a["url"])
+                                    for a in evt.get("attachments", [])])
+        await self._dispatch("on_message", msg)
+
+    async def _on_reaction(self, evt):
+        await self._dispatch("on_raw_reaction_add", _ReactionPayload(
+            evt["channel_id"], evt["message_id"], evt["user_id"], evt["emoji"]))
+
+    async def _on_interaction(self, evt):
+        cbs = self._view_cbs.get(evt["message_id"], {})
+        cb = cbs.get(evt["custom_id"])
+        if cb:
+            msg = _Message(self, evt["channel_id"], evt["message_id"])
+            await cb(_Interaction(self, evt["interaction_id"], evt["user_id"], msg))
+
+    async def _main(self):
+        self._conn.on_message = self._on_message
+        self._conn.on_reaction = self._on_reaction
+        self._conn.on_interaction = self._on_interaction
+        while True:
+            if not await self._conn.connect():
+                await _ensure_proxy_running()
+                if not await self._conn.connect():
+                    await asyncio.sleep(2)
+                    continue
+            await self._conn.subscribe(self.channel_id)
+            try:
+                who = await self._conn.whoami()
+                self.user = _Author(who.get("user_id", 0), True)
+            except Exception:
+                pass
+            await self._dispatch("on_ready")
+            # block until the connection drops, then reconnect/respawn
+            closed = asyncio.Event()
+
+            async def _on_close():
+                closed.set()
+            self._conn.on_close = _on_close
+            await closed.wait()
+            LOG.warning("proxy connection lost; reconnecting")
+            self._conn = _ProxyConn(self._conn.sock_path)
+            self._conn.on_message = self._on_message
+            self._conn.on_reaction = self._on_reaction
+            self._conn.on_interaction = self._on_interaction
+
+
+async def _ensure_proxy_running() -> None:
+    """Spawn the proxy if it isn't up; flock so concurrent sessions spawn once."""
+    lock = open(Path.home() / ".claudebot-proxy-spawn.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not os.path.exists(PROXY_SOCK):
+            LOG.info("starting Discord proxy")
+            subprocess.Popen([sys.executable, str(SCRIPT_DIR / "claudebot.py"),
+                              "--discord-proxy"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            for _ in range(50):
+                if os.path.exists(PROXY_SOCK):
+                    break
+                await asyncio.sleep(0.2)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def main() -> None:
