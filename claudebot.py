@@ -190,6 +190,12 @@ def claude_command(state: dict) -> str:
     session_flag = "--resume" if state.get("resume") else "--session-id"
     cmd = ["claude", session_flag, state["session_id"],
            "--dangerously-skip-permissions", *state.get("claude_args", [])]
+    # Run claude inside a login bash so the user's shell env loads (e.g.
+    # ~/.cargo/bin from ~/.profile/~/.bashrc) — claude launched directly gets
+    # no shell init, so MCP servers etc. miss those PATH additions. -l sources
+    # the profile chain; BASH_ENV (set below) covers ~/.bashrc for this
+    # non-interactive shell too.
+    cmd = ["bash", "-lc", "exec " + " ".join(shlex.quote(c) for c in cmd)]
     cfg = state["config"]
     if container_enabled(cfg):
         wd = state["work_dir"]
@@ -198,6 +204,7 @@ def claude_command(state: dict) -> str:
                "--init",  # tini as PID 1 to reap zombies (claude isn't an init system)
                "--name", container_name(cfg["TMUX_SESSION"]),
                "-e", "IS_SANDBOX=1",
+               "-e", "BASH_ENV=/root/.bashrc",  # load ~/.bashrc in the login bash
                # so in-container tooling (e.g. entrypoint scripts) can post
                # to the bridged channel
                "-e", f"CLAUDEBOT_DISCORD_TOKEN={cfg.get('DISCORD_TOKEN', '')}",
@@ -327,11 +334,15 @@ def resolve_image(cfg: dict, work_dir: str) -> str:
 
 
 def launch(cfg: dict, claude_args: list[str]) -> None:
-    missing = [k for k in ("DISCORD_TOKEN", "CHANNEL_ID", "USER_ID") if not cfg.get(k)]
-    if missing:
-        flags = ", ".join(f"--{k.lower().replace('_', '-')}" for k in missing)
-        sys.exit(f"claudebot: missing {', '.join(missing)} — "
-                 f"set in ./.claudebot, {GLOBAL_CONFIG}, or via {flags}")
+    # The Discord bridge is optional: with no CHANNEL_ID we just run claude in
+    # tmux (no relay). When a channel IS set, the bridge needs token + user.
+    bridge = bool(cfg.get("CHANNEL_ID"))
+    if bridge:
+        missing = [k for k in ("DISCORD_TOKEN", "USER_ID") if not cfg.get(k)]
+        if missing:
+            flags = ", ".join(f"--{k.lower().replace('_', '-')}" for k in missing)
+            sys.exit(f"claudebot: CHANNEL_ID is set but missing {', '.join(missing)} — "
+                     f"set in ./.claudebot, {GLOBAL_CONFIG}, or via {flags}")
 
     name = cfg["TMUX_SESSION"]
     cwd = str(Path.cwd())
@@ -377,14 +388,16 @@ def launch(cfg: dict, claude_args: list[str]) -> None:
     tmux_sync("set-option", "-t", session_t(name), "window-size", "manual")
     tmux_sync("send-keys", "-t", claude_win(name), claude_command(state), "Enter")
 
-    bridge_cmd = (f"exec {shlex.quote(str(SCRIPT_DIR / '.venv/bin/python'))} "
-                  f"{shlex.quote(str(SCRIPT_DIR / 'claudebot.py'))} --bridge "
-                  f"--tmux-session {shlex.quote(name)}")
-    tmux_sync("new-window", "-d", "-t", session_t(name), "-n", "bridge", "-c", str(SCRIPT_DIR))
-    tmux_sync("send-keys", "-t", bridge_win(name), bridge_cmd, "Enter")
-
-    print(f"claudebot: session {session_id} in {cwd}, "
-          f"bridging Discord channel {cfg['CHANNEL_ID']}")
+    if bridge:
+        bridge_cmd = (f"exec {shlex.quote(str(SCRIPT_DIR / '.venv/bin/python'))} "
+                      f"{shlex.quote(str(SCRIPT_DIR / 'claudebot.py'))} --bridge "
+                      f"--tmux-session {shlex.quote(name)}")
+        tmux_sync("new-window", "-d", "-t", session_t(name), "-n", "bridge", "-c", str(SCRIPT_DIR))
+        tmux_sync("send-keys", "-t", bridge_win(name), bridge_cmd, "Enter")
+        print(f"claudebot: session {session_id} in {cwd}, "
+              f"bridging Discord channel {cfg['CHANNEL_ID']}")
+    else:
+        print(f"claudebot: session {session_id} in {cwd} (no CHANNEL_ID — Discord bridge off)")
     attach(name)
 
 
