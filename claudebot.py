@@ -1242,6 +1242,10 @@ def run_bridge(tmux_session: str) -> None:
     # through here; a single consumer preserves order.
     out_q: asyncio.Queue = asyncio.Queue()
     SEND_ATTEMPTS = 6
+    # one nonce per outbound message, stable across its retries, so a resend
+    # after an ambiguous failure is deduped by the proxy and by Discord. Seeded
+    # off the clock to avoid colliding with a previous bridge's in-flight sends.
+    send_nonce = [int(time.time() * 1000)]
 
     def enqueue(content: str | None = None, embed=None,
                 file_bytes: bytes | None = None, filename: str | None = None) -> None:
@@ -1251,6 +1255,8 @@ def run_bridge(tmux_session: str) -> None:
     async def sender_loop() -> None:
         while True:
             item = await out_q.get()
+            send_nonce[0] += 1
+            nonce = str(send_nonce[0])  # stable across this item's retries
             for attempt in range(1, SEND_ATTEMPTS + 1):
                 try:
                     channel = await get_chan()
@@ -1258,7 +1264,7 @@ def run_bridge(tmux_session: str) -> None:
                             if item["file_bytes"] is not None else discord.utils.MISSING)
                     await channel.send(item["content"],
                                        embed=item["embed"] or discord.utils.MISSING,
-                                       file=file)
+                                       file=file, nonce=nonce)
                     if attempt > 1:
                         LOG.info(f"send succeeded on attempt {attempt}")
                     break
@@ -1644,7 +1650,10 @@ def run_bridge(tmux_session: str) -> None:
             else:
                 return
             last_status_edit = time.time()
-        except discord.HTTPException:
+        except (discord.HTTPException, ConnectionError, asyncio.TimeoutError, OSError):
+            # cosmetic status message — never let a proxy hiccup crash the
+            # transcript watcher (a raised error here would drop the rest of
+            # the batch and re-relay already-sent prose on the next tick)
             pass
 
     async def finalize_status(line: str) -> None:
@@ -1986,6 +1995,8 @@ def run_proxy() -> None:
     cache: dict[int, object] = {}      # message_id -> discord.Message
     interactions: dict[int, object] = {}  # interaction_id -> discord.Interaction
     iid = [0]
+    sent_nonces: dict = {}             # client nonce -> message_id (idempotent resend)
+    nonce_order: deque = deque()       # bound sent_nonces
 
     STYLES = {"primary": discord.ButtonStyle.primary,
               "danger": discord.ButtonStyle.danger,
@@ -2069,14 +2080,28 @@ def run_proxy() -> None:
             subs.setdefault(int(cmd["channel_id"]), set()).add(writer)
             return
         if t == "send":
+            nonce = cmd.get("nonce")
+            if nonce is not None and nonce in sent_nonces:
+                # a retried send whose result frame was lost after we already
+                # delivered — return the original id rather than post a duplicate
+                if cmd.get("id"):
+                    await _send_frame(writer, {"type": "result", "id": cmd["id"],
+                                               "message_id": sent_nonces[nonce]})
+                return
             ch = client.get_channel(int(cmd["channel_id"])) or \
                 await client.fetch_channel(int(cmd["channel_id"]))
             sent = await ch.send(cmd.get("content") or None,
                                  embed=build_embed(cmd.get("embed")),
                                  file=build_file(cmd.get("file")),
-                                 view=build_view(cmd.get("buttons")))
+                                 view=build_view(cmd.get("buttons")),
+                                 nonce=nonce)  # Discord also dedups same-nonce sends
             cache[sent.id] = sent
             owner[sent.id] = writer
+            if nonce is not None:
+                sent_nonces[nonce] = sent.id
+                nonce_order.append(nonce)
+                if len(nonce_order) > 1000:
+                    sent_nonces.pop(nonce_order.popleft(), None)
             if cmd.get("id"):
                 await _send_frame(writer, {"type": "result", "id": cmd["id"], "message_id": sent.id})
         elif t == "edit":
@@ -2223,24 +2248,36 @@ class _ProxyConn:
             await self.on_close()
 
     async def _call(self, obj: dict, want_result: bool = False):
+        if not want_result:
+            # fire-and-forget UI side effect (edit/delete/react/typing/subscribe):
+            # best-effort, never raise. A transient proxy hiccup must not crash
+            # the transcript watcher or a status/typing loop. On reconnect the
+            # bridge re-subscribes, so a dropped subscribe self-heals too.
+            if self.writer is not None:
+                try:
+                    await _send_frame(self.writer, obj)
+                except (OSError, ConnectionError):
+                    pass
+            return None
+        # want_result: the caller needs the reply and handles failure itself
+        # (sender_loop retries; status sends swallow) — so raising is correct.
         if self.writer is None:
             raise ConnectionError("proxy not connected")
-        if want_result:
-            self._req += 1
-            obj["id"] = self._req
-            fut = asyncio.get_event_loop().create_future()
-            self._pending[self._req] = fut
-            await _send_frame(self.writer, obj)
-            return await asyncio.wait_for(fut, 15)
+        self._req += 1
+        obj["id"] = self._req
+        fut = asyncio.get_event_loop().create_future()
+        self._pending[self._req] = fut
         await _send_frame(self.writer, obj)
-        return None
+        return await asyncio.wait_for(fut, 15)
 
     async def subscribe(self, channel_id: int):
         await self._call({"type": "subscribe", "channel_id": channel_id})
 
-    async def send(self, channel_id, content=None, embed=None, file=None, buttons=None) -> int:
+    async def send(self, channel_id, content=None, embed=None, file=None, buttons=None,
+                   nonce=None) -> int:
         r = await self._call({"type": "send", "channel_id": channel_id, "content": content,
-                              "embed": embed, "file": file, "buttons": buttons}, want_result=True)
+                              "embed": embed, "file": file, "buttons": buttons,
+                              "nonce": nonce}, want_result=True)
         return r["message_id"]
 
     async def edit(self, message_id, channel_id=None, content=..., embed=..., attachments=None,
@@ -2334,11 +2371,11 @@ class _Channel:
     def __init__(self, px, cid):
         self._px, self.id = px, cid
 
-    async def send(self, content=None, *, embed=None, file=None, view=None):
+    async def send(self, content=None, *, embed=None, file=None, view=None, nonce=None):
         specs = _view_to_specs(view)
         mid = await self._px._conn.send(
             self.id, content=content or None, embed=_embed_to_dict(embed),
-            file=_file_to_payload(file), buttons=specs[0] if specs else None)
+            file=_file_to_payload(file), buttons=specs[0] if specs else None, nonce=nonce)
         if specs:
             self._px._view_cbs[mid] = specs[1]
         return _Message(self._px, self.id, mid)
