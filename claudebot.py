@@ -1938,7 +1938,13 @@ def run_bridge(tmux_session: str) -> None:
 # Protocol: newline-delimited JSON; binary (images) base64 in `file.data`.
 # ===========================================================================
 
-PROXY_SOCK = str(Path.home() / ".claudebot-discord-proxy.sock")
+PROXY_HOST = "127.0.0.1"
+# A fixed localhost port is the singleton lock: exactly one proxy can bind it;
+# a duplicate gets EADDRINUSE and exits, so whoever holds the port is the
+# leader. When it dies the port frees and the next spawn wins — free leader
+# election, no socket files or flocks to get stale. (flock still dedups the
+# spawn race; the bind is the real guard.)
+PROXY_PORT = int(os.environ.get("CLAUDEBOT_PROXY_PORT", "47917"))
 
 
 async def _send_frame(writer, obj: dict) -> None:
@@ -2153,18 +2159,19 @@ def run_proxy() -> None:
             writer.close()
 
     async def main_async():
-        if os.path.exists(PROXY_SOCK):
-            os.unlink(PROXY_SOCK)
-        server = await asyncio.start_unix_server(handle_conn, PROXY_SOCK)
-        LOG.info(f"proxy listening on {PROXY_SOCK}")
+        try:
+            server = await asyncio.start_server(handle_conn, PROXY_HOST, PROXY_PORT)
+        except OSError as e:
+            # another proxy already holds the port — it's the leader, so we just
+            # exit. No stomping the listener (the old unix-socket path unlinked
+            # and rebound, spawning a second contending gateway connection).
+            LOG.info(f"another proxy owns {PROXY_HOST}:{PROXY_PORT} ({e}); exiting")
+            return
+        LOG.info(f"proxy listening on {PROXY_HOST}:{PROXY_PORT}")
         async with server:
             await client.start(token)
 
-    try:
-        asyncio.run(main_async())
-    finally:
-        if os.path.exists(PROXY_SOCK):
-            os.unlink(PROXY_SOCK)
+    asyncio.run(main_async())
 
 
 class _ProxyConn:
@@ -2172,8 +2179,7 @@ class _ProxyConn:
     a recv loop dispatching result/message/reaction/interaction to callbacks.
     The discord-quacking ProxyClient is layered on top of this."""
 
-    def __init__(self, sock_path: str = PROXY_SOCK) -> None:
-        self.sock_path = sock_path
+    def __init__(self) -> None:
         self.reader = self.writer = None
         self._req = 0
         self._pending: dict[int, asyncio.Future] = {}
@@ -2181,8 +2187,8 @@ class _ProxyConn:
 
     async def connect(self) -> bool:
         try:
-            self.reader, self.writer = await asyncio.open_unix_connection(self.sock_path)
-        except (OSError, FileNotFoundError):
+            self.reader, self.writer = await asyncio.open_connection(PROXY_HOST, PROXY_PORT)
+        except OSError:
             return False
         asyncio.create_task(self._recv_loop())
         return True
@@ -2206,17 +2212,26 @@ class _ProxyConn:
                 await self.on_reaction(msg)
             elif t == "interaction" and self.on_interaction:
                 await self.on_interaction(msg)
+        # connection closed — fail any in-flight calls now so callers retry
+        # immediately instead of blocking until the per-call timeout (a dead
+        # proxy used to cost 30s per send, which is what made relays minutes late)
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("proxy connection closed"))
+        self._pending.clear()
         if self.on_close:
             await self.on_close()
 
     async def _call(self, obj: dict, want_result: bool = False):
+        if self.writer is None:
+            raise ConnectionError("proxy not connected")
         if want_result:
             self._req += 1
             obj["id"] = self._req
             fut = asyncio.get_event_loop().create_future()
             self._pending[self._req] = fut
             await _send_frame(self.writer, obj)
-            return await asyncio.wait_for(fut, 30)
+            return await asyncio.wait_for(fut, 15)
         await _send_frame(self.writer, obj)
         return None
 
@@ -2413,9 +2428,9 @@ class ProxyClient:
     events (wrapped as _Message/_Interaction/_ReactionPayload) to handlers
     registered with @client.event."""
 
-    def __init__(self, channel_id: int, user_id: int, sock_path: str = PROXY_SOCK):
+    def __init__(self, channel_id: int, user_id: int):
         self.channel_id, self.user_id = channel_id, user_id
-        self._conn = _ProxyConn(sock_path)
+        self._conn = _ProxyConn()
         self._handlers: dict = {}
         self._view_cbs: dict = {}   # message_id -> {custom_id: callback}
         self.user = _Author(0, True)
@@ -2490,25 +2505,37 @@ class ProxyClient:
             self._conn.on_close = _on_close
             await closed.wait()
             LOG.warning("proxy connection lost; reconnecting")
-            self._conn = _ProxyConn(self._conn.sock_path)
+            self._conn = _ProxyConn()
             self._conn.on_message = self._on_message
             self._conn.on_reaction = self._on_reaction
             self._conn.on_interaction = self._on_interaction
 
 
+async def _proxy_reachable() -> bool:
+    """True if something is already listening on the proxy port."""
+    try:
+        _, w = await asyncio.open_connection(PROXY_HOST, PROXY_PORT)
+        w.close()
+        return True
+    except OSError:
+        return False
+
+
 async def _ensure_proxy_running() -> None:
-    """Spawn the proxy if it isn't up; flock so concurrent sessions spawn once."""
+    """Spawn the proxy if nothing is serving the port; flock so concurrent
+    sessions only spawn it once. The port bind is the real singleton guard (a
+    duplicate proxy exits on EADDRINUSE), so this is just a fast-path/respawn."""
     lock = open(Path.home() / ".claudebot-proxy-spawn.lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if not os.path.exists(PROXY_SOCK):
+        if not await _proxy_reachable():
             LOG.info("starting Discord proxy")
             subprocess.Popen([sys.executable, str(SCRIPT_DIR / "claudebot.py"),
                               "--discord-proxy"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
             for _ in range(50):
-                if os.path.exists(PROXY_SOCK):
+                if await _proxy_reachable():
                     break
                 await asyncio.sleep(0.2)
     finally:
