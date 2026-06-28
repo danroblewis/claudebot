@@ -205,6 +205,10 @@ def claude_command(state: dict) -> str:
                "--init",  # tini as PID 1 to reap zombies (claude isn't an init system)
                "--name", container_name(cfg["TMUX_SESSION"]),
                "-e", "IS_SANDBOX=1",
+               # render to the main screen, not an alternate-screen buffer, so
+               # `tmux capture-pane` can read the live TUI (newer Claude Code
+               # defaults to a fullscreen alt-screen renderer otherwise)
+               "-e", "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1",
                "-e", "BASH_ENV=/root/.bashrc",  # load ~/.bashrc in the login bash
                # so in-container tooling (e.g. entrypoint scripts) can post
                # to the bridged channel
@@ -328,8 +332,18 @@ def resolve_image(cfg: dict, work_dir: str) -> str:
         dockerfile = SCRIPT_DIR / "Dockerfile"
         tag = DEFAULT_IMAGE
     print(f"claudebot: building image '{tag}' from {dockerfile} ...")
-    if subprocess.run(["docker", "build", "-t", tag, "-f", str(dockerfile),
-                       str(dockerfile.parent)]).returncode != 0:
+    build_cmd = ["docker", "build", "-t", tag, "-f", str(dockerfile)]
+    # Forward an SSH key into the build so `RUN --mount=type=ssh` can clone
+    # private deps (e.g. the semfora engine) without baking creds into the image.
+    # Prefer a running agent; otherwise pass the default key file directly.
+    default_key = Path.home() / ".ssh" / "id_ed25519"
+    if os.environ.get("SSH_AUTH_SOCK"):
+        build_cmd += ["--ssh", "default"]
+    elif default_key.is_file():
+        build_cmd += ["--ssh", f"default={default_key}"]
+    build_cmd.append(str(dockerfile.parent))
+    env = {**os.environ, "DOCKER_BUILDKIT": "1"}
+    if subprocess.run(build_cmd, env=env).returncode != 0:
         sys.exit("claudebot: docker build failed")
     return tag
 
@@ -370,6 +384,17 @@ def launch(cfg: dict, claude_args: list[str]) -> None:
             sys.exit("claudebot: container mode requires docker (is Docker Desktop running?)")
         cfg["CONTAINER_IMAGE"] = resolve_image(cfg, cwd)  # persists via state for !new
         CONTAINER_HOME.mkdir(exist_ok=True)
+        # pre-accept the bypassPermissions disclaimer so
+        # --dangerously-skip-permissions actually engages (newer Claude Code
+        # downgrades it to "default" until accepted once)
+        cc = CONTAINER_HOME / ".claude.json"
+        try:
+            conf = json.loads(cc.read_text()) if cc.exists() else {}
+            if not conf.get("bypassPermissionsModeAccepted"):
+                conf["bypassPermissionsModeAccepted"] = True
+                cc.write_text(json.dumps(conf, indent=2))
+        except (OSError, json.JSONDecodeError):
+            pass
 
     resume_id, claude_args = resolve_resume(claude_args, cfg, cwd)
     session_id = resume_id or str(uuid.uuid4())
